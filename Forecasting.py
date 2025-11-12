@@ -34,21 +34,26 @@ def multiselect_all(label: str, options: List[str], key: str) -> List[str]:
     Uses an internal *_raw key so we can keep `key` as the canonical selection state.
     """
     all_label = "All"
-    opts = [all_label] + list(options)
+opts = [all_label] + list(options)
 
-    prev_selection = st.session_state.get(key, list(options))  # default to All on first load
-    use_all = (set(prev_selection) == set(options)) and len(options) > 0
-    default_raw = [all_label] if use_all else prev_selection
+# Default to empty on first load (previously defaulted to All)
+prev_selection = st.session_state.get(key, [])
 
-    chosen = st.sidebar.multiselect(label, opts, default=default_raw, key=f"{key}_raw")
+# Treat as 'All' only if previous selection equals all options AND is non-empty
+use_all = (set(prev_selection) == set(options)) and (len(prev_selection) > 0)
 
-    if all_label in chosen:
-        st.session_state[key] = list(options)
-        return list(options)
+# Default for the widget: show "All" if use_all, else whatever was previously chosen (sanitized)
+default_raw = [all_label] if use_all else [v for v in prev_selection if v in options]
 
-    cleaned = [c for c in chosen if c != all_label]
-    st.session_state[key] = cleaned
-    return cleaned
+chosen = st.sidebar.multiselect(label, opts, default=default_raw, key=f"{key}_raw")
+
+if all_label in chosen:
+    st.session_state[key] = list(options)
+    return list(options)
+else:
+    final = [v for v in chosen if v != all_label]
+    st.session_state[key] = final
+    return final
 
 def to_num_clean(series: pd.Series) -> pd.Series:
     """Coerce strings like '$1,234.50' -> 1234.50 (floats)."""
