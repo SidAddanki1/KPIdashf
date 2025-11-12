@@ -1,55 +1,90 @@
-# C-Store KPI Dashboard (Dept switchboard + Per-Tab Local Filters)
-# - Single compact global sidebar: Department
-# - Local filters INSIDE each tab; act only on that tab
-# - Options (Stores, Categories, Brands, Items, Payment) come from raw_df (full list)
-# - KPI Overview, Trends (w/ conservative forecasts), Top-N, Basket Affinity
-# - Price Ladder, Store Map, Assortment & Space Optimization
-# - No CSV upload (fixed path)
+# ===========================================
+# C-Store KPI Insights Suite (Executive Edition)
+# - One GLOBAL filter: Department (compact sidebar)
+# - LOCAL per-tab filters (Store/Category/Brand/Product/Payment/Date/Granularity)
+# - Visual polish: Plotly template, KPI tiles, consistent tooltips
+# - Metric definitions everywhere (hover + glossary)
+# - Forecasts: conservative ETS/naive with capped horizons
+# - No CSV uploader (reads DATA_PATH only)
+# ===========================================
 
 import os
+from typing import Dict, Tuple, List, Optional
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.io as pio
+import plotly.graph_objects as go
 import streamlit as st
+
 from itertools import combinations
 from collections import Counter
-from typing import Dict, Tuple, List, Optional
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-# ---------------------------------
-# App Config
-# ---------------------------------
-st.set_page_config(page_title="C-Store KPI Dashboard", layout="wide", initial_sidebar_state="expanded")
-pio.templates.default = "plotly_white"
-
-# ---------------------------------
-# Tiny CSS to make the single sidebar filter compact
-# ---------------------------------
-st.markdown(
-    """
-    <style>
-      section[data-testid="stSidebar"] { width: 260px; min-width: 260px; }
-      [data-testid="stSidebar"] .block-container { padding-top: .5rem; padding-bottom: .5rem; }
-      [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { margin: .25rem 0 .25rem 0; }
-    </style>
-    """,
-    unsafe_allow_html=True
+# ----------------------------
+# App & Theme
+# ----------------------------
+st.set_page_config(
+    page_title="C-Store KPI Insights Suite",
+    layout="wide",
+    initial_sidebar_state="collapsed",  # compact—only one global filter lives here
 )
 
-# ---------------------------------
-# Helpers
-# ---------------------------------
-RULE_MAP = {"Daily": "D", "Weekly": "W-SUN", "Monthly": "MS"}
+# Plotly template (clean, brandable)
+pio.templates["sa_clean"] = pio.templates["plotly_white"]
+pio.templates["sa_clean"].layout.update(
+    font=dict(family="Inter, system-ui, -apple-system, Segoe UI", size=12),
+    margin=dict(l=8, r=8, t=36, b=8),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    xaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)", title=None),
+    yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False),
+    colorway=["#4F46E5","#0EA5E9","#22C55E","#F59E0B","#EF4444","#8B5CF6"],
+)
+pio.templates.default = "sa_clean"
 
-def to_num_clean(series: pd.Series) -> pd.Series:
+# ----------------------------
+# Configuration
+# ----------------------------
+DATA_PATH = "cstorereal.csv"  # <— set to your file path
+
+# ----------------------------
+# Metric Glossary (global + reused in tooltips)
+# ----------------------------
+GLOSSARY = {
+    "Total_Sale": "Gross revenue (post-discount if provided). Sum of Total_Sale.",
+    "Quantity": "Units sold. Sum of Quantity.",
+    "Transactions": "Count of unique Transaction_ID.",
+    "Spend per Basket": "Total Sales ÷ Transactions; average ticket.",
+    "ASP": "Average selling price = Total Sales ÷ Units.",
+    "Median_Unit_Price": "Median of Unit_Price observations in scope.",
+    "Velocity_$/SKU/Store/Week": "SKU sales normalized by Active Stores and Weeks in range.",
+    "% of Category Sales": "SKU sales ÷ Category sales × 100.",
+    "Velocity_Rank_in_Category": "Dense rank of SKU by Velocity within Category (1 = fastest).",
+    "Lift": "Co-purchase frequency vs independence baseline (>1 positive association).",
+    "Confidence (%)": "P(B|A): share of A baskets that also contain B.",
+    "Support (A,B)": "Share of total baskets that contain both A and B.",
+    "Avg Co-Basket Spend": "Average value of baskets where both A and B are present.",
+    "Index_vs_Overall": "100 × Geo_Share ÷ Overall_Share ( >100 over-index ).",
+    "Geo_Share": "Geo’s sales share for the item/brand.",
+    "Overall_Share": "Overall sales share for the item/brand across all geos.",
+}
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def _to_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
 
 @st.cache_data(show_spinner=False)
-def load_and_normalize(path_or_buffer) -> pd.DataFrame:
-    df = pd.read_csv(path_or_buffer)
+def load_and_normalize(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        st.error(f"CSV not found at: {os.path.abspath(path)}")
+        st.stop()
 
-    # Canonicalize columns
+    df = pd.read_csv(path)
+
+    # Canonicalize column names when common alternates are present
     rename_map = {
         "Brand": "Brand_Name",
         "Units_Sold": "Quantity",
@@ -62,218 +97,176 @@ def load_and_normalize(path_or_buffer) -> pd.DataFrame:
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    required_min = {"Date", "Transaction_ID", "Store_ID", "Category", "Item"}
-    missing = [c for c in required_min if c not in df.columns]
+    required = {"Date", "Transaction_ID", "Store_ID", "Category", "Item"}
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {missing}.")
+        st.error(f"Missing required columns: {missing}")
+        st.stop()
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date", "Transaction_ID"])
-
     for c in ["Transaction_ID", "Store_ID", "Item", "Brand_Name", "Category", "Payment_Method"]:
         if c in df.columns:
             df[c] = df[c].astype(str)
 
     if "Unit_Price" in df.columns:
-        df["Unit_Price"] = to_num_clean(df["Unit_Price"]).fillna(0.0)
+        df["Unit_Price"] = _to_num(df["Unit_Price"]).fillna(0.0)
     if "Quantity" in df.columns:
-        df["Quantity"] = to_num_clean(df["Quantity"]).fillna(0.0)
+        df["Quantity"] = _to_num(df["Quantity"]).fillna(0.0)
     if "Total_Sale" in df.columns:
-        df["Total_Sale"] = to_num_clean(df["Total_Sale"]).fillna(0.0)
+        df["Total_Sale"] = _to_num(df["Total_Sale"]).fillna(0.0)
 
+    # Compute Total_Sale when missing/zero and we have Unit_Price × Quantity
     if {"Quantity", "Unit_Price"} <= set(df.columns):
         if "Total_Sale" not in df.columns:
             df["Total_Sale"] = (df["Quantity"] * df["Unit_Price"]).round(2)
         else:
-            needs = (df["Total_Sale"] == 0) | (df["Total_Sale"].isna())
-            df.loc[needs, "Total_Sale"] = (df.loc[needs, "Quantity"] * df.loc[needs, "Unit_Price"]).round(2)
+            need = (df["Total_Sale"].isna()) | (df["Total_Sale"] == 0)
+            df.loc[need, "Total_Sale"] = (df.loc[need, "Quantity"] * df.loc[need, "Unit_Price"]).round(2)
 
     return df
 
-def multiselect_all_ui(label: str, options: list, default_all: bool, key: str):
-    """Multiselect with explicit 'All' behavior."""
-    all_label = "All"
-    opts = [all_label] + list(options)
-    default_vals = [all_label] if default_all else []
-    raw = st.multiselect(label, opts, default=default_vals, key=key)
-    if all_label in raw or len(raw) == 0:
-        return list(options)  # All
-    return [v for v in raw if v != all_label]
-
-def local_filters_block(raw_df: pd.DataFrame, key_prefix: str):
-    """
-    Per-tab local filters; options come from raw_df so the full lists are always available
-    (e.g., all 10 stores). Returns (df_filtered, rule, start_date, end_date).
-    """
-    # Full option lists from the entire dataset
-    stores = sorted(raw_df["Store_ID"].unique().tolist()) if "Store_ID" in raw_df.columns else []
-    cats   = sorted(raw_df["Category"].unique().tolist()) if "Category" in raw_df.columns else []
-    brands = sorted(raw_df["Brand_Name"].unique().tolist()) if "Brand_Name" in raw_df.columns else []
-    prods  = sorted(raw_df["Item"].unique().tolist()) if "Item" in raw_df.columns else []
-    pays   = sorted(raw_df["Payment_Method"].unique().tolist()) if "Payment_Method" in raw_df.columns else []
-
-    # Dates
-    min_date = raw_df["Date"].min().date()
-    max_date = raw_df["Date"].max().date()
-
-    with st.expander("Filters", expanded=False):
-        c1, c2, c3 = st.columns([1.2, 1.2, 1])
-        with c1:
-            sel_stores = multiselect_all_ui("Store(s)", stores, default_all=True, key=f"{key_prefix}_stores")
-            sel_cats   = multiselect_all_ui("Category", cats, default_all=True, key=f"{key_prefix}_cats")
-            sel_brands = multiselect_all_ui("Brand", brands, default_all=True, key=f"{key_prefix}_brands") if brands else []
-        with c2:
-            sel_prods  = multiselect_all_ui("Product", prods, default_all=True, key=f"{key_prefix}_prods")
-            sel_pays   = multiselect_all_ui("Payment Method", pays, default_all=True, key=f"{key_prefix}_pays") if pays else []
-        with c3:
-            start_date = st.date_input("Start", value=min_date, min_value=min_date, max_value=max_date, key=f"{key_prefix}_start")
-            end_date   = st.date_input("End",   value=max_date, min_value=min_date, max_value=max_date, key=f"{key_prefix}_end")
-            freq = st.radio("Granularity", ["Daily", "Weekly", "Monthly"], index=1, key=f"{key_prefix}_freq")
-
-    # Apply only to this tab
-    df = raw_df[
-        (raw_df["Date"] >= pd.to_datetime(start_date)) &
-        (raw_df["Date"] <= pd.to_datetime(end_date))
-    ].copy()
-
-    if sel_stores and "Store_ID" in df.columns:
-        df = df[df["Store_ID"].isin(sel_stores)]
-    if sel_cats and "Category" in df.columns:
-        df = df[df["Category"].isin(sel_cats)]
-    if sel_brands and "Brand_Name" in df.columns:
-        df = df[df["Brand_Name"].isin(sel_brands)]
-    if sel_prods and "Item" in df.columns:
-        df = df[df["Item"].isin(sel_prods)]
-    if sel_pays and "Payment_Method" in df.columns:
-        df = df[df["Payment_Method"].isin(sel_pays)]
-
-    rule = RULE_MAP[freq]
-    return df, rule, start_date, end_date
+RAW = load_and_normalize(DATA_PATH)
 
 # ---------------------------------
-# Metrics & Computations (cached)
+# GLOBAL: Department filter (compact)
 # ---------------------------------
-@st.cache_data(show_spinner=False)
-def calculate_kpis(df: pd.DataFrame) -> Dict[str, float]:
-    total_sales = df["Total_Sale"].sum() if "Total_Sale" in df.columns else 0.0
-    total_qty   = df["Quantity"].sum() if "Quantity" in df.columns else 0.0
-    tx          = df["Transaction_ID"].nunique() if "Transaction_ID" in df.columns else 0
-    spend_per_basket = (total_sales / tx) if tx else 0.0
-    asp = (total_sales / total_qty) if total_qty else 0.0
-    return dict(total_sales=total_sales, total_qty=total_qty, tx=tx, spend_per_basket=spend_per_basket, asp=asp)
+st.sidebar.markdown("### Department")
+DEPT_OPTIONS = [
+    "Strategy & Finance",
+    "Merchandising & Pricing",
+    "Store Ops & Supply Chain",
+    "Marketing & Loyalty",
+    "All Departments"
+]
+department = st.sidebar.selectbox("Select Department", DEPT_OPTIONS, index=0, key="global_department")
 
-@st.cache_data(show_spinner=False)
-def calculate_trends(df: pd.DataFrame, rule: str, group_dim: Optional[str]) -> pd.DataFrame:
-    group_cols = [pd.Grouper(key="Date", freq=rule)]
-    if group_dim and group_dim in df.columns:
-        group_cols.append(group_dim)
-    trend_df = (
-        df.groupby(group_cols, dropna=False)
-          .agg(Total_Sale=("Total_Sale", "sum"),
-               Quantity=("Quantity", "sum"),
-               Transactions=("Transaction_ID", "nunique"))
-          .reset_index()
-          .sort_values("Date")
+# Which tabs show for which department
+DEPT_TABS = {
+    "Strategy & Finance": ["📊 KPI Overview", "📈 KPI Trends"],
+    "Merchandising & Pricing": ["🏆 Top-N Views", "💲 Price Ladder", "📦 Assortment & Space Optimization"],
+    "Store Ops & Supply Chain": ["🗺️ Store Map", "📊 KPI Overview"],
+    "Marketing & Loyalty": ["🧺 Basket Affinity", "🏆 Top-N Views"],
+    "All Departments": [
+        "📊 KPI Overview", "📈 KPI Trends", "🏆 Top-N Views",
+        "🧺 Basket Affinity", "💲 Price Ladder", "🗺️ Store Map",
+        "📦 Assortment & Space Optimization"
+    ]
+}
+
+# ----------------------------
+# Local Filter Builder (per tab)
+# ----------------------------
+RULE_MAP = {"Daily": "D", "Weekly": "W-SUN", "Monthly": "MS"}
+
+def local_filters_block(df: pd.DataFrame, prefix: str):
+    """
+    Per-tab filter block; keys isolated by prefix to avoid collisions.
+    Returns (filtered_df, rule, start_date, end_date, selections_dict)
+    """
+    st.markdown(
+        f"""
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin:-6px 0 6px 0;">
+          <span style="font-weight:600;">Filters:</span>
+        </div>
+        """, unsafe_allow_html=True
     )
-    trend_df["Spend per Basket"] = np.where(trend_df["Transactions"] > 0,
-                                            trend_df["Total_Sale"] / trend_df["Transactions"], 0.0)
-    return trend_df
+
+    min_d = df["Date"].min().date()
+    max_d = df["Date"].max().date()
+
+    col1, col2, col3, col4, col5, col6 = st.columns([1.0,1.0,1.0,1.0,1.0,1.0])
+
+    with col1:
+        stores = sorted(df["Store_ID"].unique().tolist())
+        sel_stores = st.multiselect("Store(s)", stores, default=stores, key=f"{prefix}_stores")
+
+    with col2:
+        cats = sorted(df["Category"].unique().tolist())
+        sel_cats = st.multiselect("Category", cats, default=cats, key=f"{prefix}_cats")
+
+    with col3:
+        brands = sorted(df["Brand_Name"].unique().tolist()) if "Brand_Name" in df.columns else []
+        sel_brands = st.multiselect("Brand", brands, default=brands, key=f"{prefix}_brands")
+
+    with col4:
+        prods = sorted(df["Item"].unique().tolist())
+        sel_items = st.multiselect("Product", prods, default=prods, key=f"{prefix}_items")
+
+    with col5:
+        pays = sorted(df["Payment_Method"].unique().tolist()) if "Payment_Method" in df.columns else []
+        sel_pay = st.multiselect("Payment Method", pays, default=pays, key=f"{prefix}_pays")
+
+    with col6:
+        gran = st.radio("Time", ["Daily","Weekly","Monthly"], horizontal=True, index=1, key=f"{prefix}_gran")
+        rule = RULE_MAP[gran]
+
+    c7, c8 = st.columns([1,1])
+    with c7:
+        start_date = st.date_input("Start", value=min_d, key=f"{prefix}_start")
+    with c8:
+        end_date = st.date_input("End", value=max_d, key=f"{prefix}_end")
+
+    # Apply local filters only to this tab
+    scope = df[(df["Date"] >= pd.to_datetime(start_date)) & (df["Date"] <= pd.to_datetime(end_date))].copy()
+    if sel_stores: scope = scope[scope["Store_ID"].isin(sel_stores)]
+    if sel_cats: scope = scope[scope["Category"].isin(sel_cats)]
+    if sel_brands and "Brand_Name" in scope.columns:
+        scope = scope[scope["Brand_Name"].isin(sel_brands)]
+    if sel_items: scope = scope[scope["Item"].isin(sel_items)]
+    if sel_pay and "Payment_Method" in scope.columns:
+        scope = scope[scope["Payment_Method"].isin(sel_pay)]
+
+    selections = {
+        "stores": sel_stores, "categories": sel_cats, "brands": sel_brands,
+        "items": sel_items, "payments": sel_pay, "granularity": gran
+    }
+    return scope, rule, start_date, end_date, selections
+
+# ----------------------------
+# KPI helpers
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def kpis(df: pd.DataFrame) -> Dict[str, float]:
+    ts = df["Total_Sale"].sum() if "Total_Sale" in df.columns else 0.0
+    qty = df["Quantity"].sum() if "Quantity" in df.columns else 0.0
+    tx = df["Transaction_ID"].nunique() if "Transaction_ID" in df.columns else 0
+    spb = ts/tx if tx else 0.0
+    asp = ts/qty if qty else 0.0
+    return dict(total_sales=ts, total_qty=qty, tx=tx, spend_per_basket=spb, asp=asp)
 
 @st.cache_data(show_spinner=False)
-def calculate_top_n(df: pd.DataFrame, dim: str, n: int) -> Tuple[pd.DataFrame, str]:
-    top_df = df.groupby(dim)["Total_Sale"].sum().sort_values(ascending=False).head(n).reset_index()
-    return top_df, "Total_Sale"
+def trends(df: pd.DataFrame, rule: str, group_dim: Optional[str]) -> pd.DataFrame:
+    group_cols = [pd.Grouper(key="Date", freq=rule)]
+    if group_dim and group_dim in df.columns: group_cols.append(group_dim)
+    t = (df.groupby(group_cols, dropna=False)
+           .agg(Total_Sale=("Total_Sale","sum"),
+                Quantity=("Quantity","sum"),
+                Transactions=("Transaction_ID","nunique"))
+           .reset_index().sort_values("Date"))
+    t["Spend per Basket"] = np.where(t["Transactions"]>0, t["Total_Sale"]/t["Transactions"], 0.0)
+    return t
 
-@st.cache_data(show_spinner=False)
-def calculate_affinity_rules(df: pd.DataFrame, key_col: str) -> pd.DataFrame:
-    scope = df.dropna(subset=["Transaction_ID", key_col]).copy()
-    if scope.empty:
-        return pd.DataFrame()
-    scope["Transaction_ID"] = scope["Transaction_ID"].astype(str)
-    scope[key_col] = scope[key_col].astype(str)
-
-    tx_count_total = scope["Transaction_ID"].nunique()
-    if tx_count_total == 0:
-        return pd.DataFrame()
-
-    basket_sales = scope.groupby("Transaction_ID")["Total_Sale"].sum()
-    tx_keys = scope.groupby("Transaction_ID")[key_col].apply(lambda s: tuple(sorted(set(s))))
-    item_counts = Counter()
-    pair_counts = Counter()
-    for keys in tx_keys:
-        for k in keys:
-            item_counts[k] += 1
-        for a, b in combinations(keys, 2):
-            pair_counts[tuple(sorted((a, b)))] += 1
-    if not pair_counts:
-        return pd.DataFrame()
-
-    item_txids_map = scope.groupby(key_col)["Transaction_ID"].apply(set)
-
-    def qty_in_txids(item: str, tx_ids: set) -> float:
-        if "Quantity" not in scope.columns or not tx_ids:
-            return 0.0
-        view = scope[(scope["Transaction_ID"].isin(tx_ids)) & (scope[key_col] == item)]
-        return float(view["Quantity"].sum())
-
-    rows = []
-    for (a, b), n_ab in pair_counts.items():
-        count_ab = n_ab
-        count_a = item_counts[a]
-        count_b = item_counts[b]
-        support_ab = count_ab / tx_count_total
-        lift = (support_ab / ((count_a / tx_count_total) * (count_b / tx_count_total))) if (count_a and count_b) else 0.0
-
-        tx_a = item_txids_map.get(a, set())
-        tx_b = item_txids_map.get(b, set())
-        co_tx = tx_a & tx_b
-
-        total_co_spend = float(basket_sales.loc[list(co_tx)].sum()) if co_tx else 0.0
-        avg_co_spend = (total_co_spend / count_ab) if count_ab else 0.0
-
-        qty_a_in_co = qty_in_txids(a, co_tx)
-        qty_b_in_co = qty_in_txids(b, co_tx)
-
-        rows.append({"Antecedent": a, "Consequent": b,
-                     "Total Co-Baskets": count_ab,
-                     "Support (A,B)": support_ab,
-                     "Confidence (A->B)": (count_ab / count_a) if count_a else 0.0,
-                     "Lift (A,B)": lift,
-                     "Total_Antecedent_Qty_in_CoBasket": qty_a_in_co,
-                     "Avg_Antecedent_Qty_in_CoBasket": (qty_a_in_co / count_ab) if count_ab else 0.0,
-                     "Total_CoBasket_Sales_Value": total_co_spend,
-                     "Avg_CoBasket_Spend": avg_co_spend})
-        rows.append({"Antecedent": b, "Consequent": a,
-                     "Total Co-Baskets": count_ab,
-                     "Support (A,B)": support_ab,
-                     "Confidence (A->B)": (count_ab / count_b) if count_b else 0.0,
-                     "Lift (A,B)": lift,
-                     "Total_Antecedent_Qty_in_CoBasket": qty_b_in_co,
-                     "Avg_Antecedent_Qty_in_CoBasket": (qty_b_in_co / count_ab) if count_ab else 0.0,
-                     "Total_CoBasket_Sales_Value": total_co_spend,
-                     "Avg_CoBasket_Spend": avg_co_spend})
-
-    out = pd.DataFrame(rows).sort_values(["Lift (A,B)", "Confidence (A->B)"], ascending=[False, False]).reset_index(drop=True)
-    return out
-
-# ---------- Forecast helpers ----------
-def _forecast_freq_meta(rule: str):
+# ----------------------------
+# Forecast helpers (conservative)
+# ----------------------------
+def _forecast_meta(rule: str):
     if rule == "D": return 30, 7, "D", "next 30 days"
     if rule.startswith("W-"): return 4, 52, rule, "next 4 weeks"
     if rule == "MS": return 1, 12, "MS", "next month"
     return 30, 7, "D", "next 30 days"
 
-def _series_from_raw(df: pd.DataFrame, rule: str, metric: str) -> pd.Series:
+def _series(df: pd.DataFrame, rule: str, metric: str) -> pd.Series:
     s = (df.set_index("Date")[metric].sort_index().resample(rule).sum().astype(float).fillna(0.0))
     s.index.name = "Date"
     return s
 
-def _fit_ets_safe(ts: pd.Series, rule: str, seasonal_periods: int):
-    use_fixed_smoothing = rule.startswith("W-")
-    use_season = seasonal_periods and (len(ts) >= 2 * seasonal_periods)
+def _fit_ets(ts: pd.Series, rule: str, seasonal_periods: int):
+    use_fixed = rule.startswith("W-")
+    use_season = seasonal_periods and (len(ts) >= 2*seasonal_periods)
     try:
-        trend_type = 'add' if use_fixed_smoothing else None
-        fit_params = {'smoothing_level': 0.1, 'smoothing_trend': 0.01, 'optimized': False} if use_fixed_smoothing else {'optimized': True}
+        trend_type = 'add' if use_fixed else None
+        fit_params = {'smoothing_level':0.1,'smoothing_trend':0.01,'optimized':False} if use_fixed else {'optimized':True}
         model = ExponentialSmoothing(
             ts, trend=trend_type, damped_trend=False,
             seasonal="add" if use_season else None,
@@ -282,8 +275,7 @@ def _fit_ets_safe(ts: pd.Series, rule: str, seasonal_periods: int):
         ).fit(**fit_params)
         fitted = model.fittedvalues.reindex(ts.index)
         resid = (ts - fitted).to_numpy()
-        resid_std = float(np.nanstd(resid))
-        return model, resid_std
+        return model, float(np.nanstd(resid))
     except Exception:
         return None, None
 
@@ -295,838 +287,712 @@ def _seasonal_naive(ts: pd.Series, steps: int, seasonal_periods: int) -> np.ndar
 
 def _choose_model(ts: pd.Series, rule: str, seasonal_periods: int):
     n = len(ts)
-    if n < max(12, seasonal_periods + 4):
-        return "naive", None, None
-    h = max(6, int(round(n * 0.12)))
+    if n < max(12, seasonal_periods+4): return "naive", None, None
+    h = max(6, int(round(n*0.12)))
     train, hold = ts.iloc[:-h], ts.iloc[-h:]
-    ets_model, resid_std = _fit_ets_safe(train, rule, seasonal_periods)
+    ets_model, resid_std = _fit_ets(train, rule, seasonal_periods)
     naive_fc = _seasonal_naive(train, h, seasonal_periods)
-    ets_fc = ets_model.forecast(h).to_numpy() if ets_model is not None else None
 
     def smape(a, f):
-        a = a.astype(float); f = f.astype(float)
-        denom = (np.abs(a) + np.abs(f)); denom[denom == 0] = 1.0
-        return float(np.mean(2.0 * np.abs(a - f) / denom))
+        a, f = a.astype(float), f.astype(float)
+        d = (np.abs(a)+np.abs(f)); d[d==0] = 1.0
+        return float(np.mean(2*np.abs(a-f)/d))
 
     a = hold.to_numpy()
-    naive_err = smape(a, naive_fc)
-    ets_err = smape(a, ets_fc) if ets_fc is not None else np.inf
-    return ("ets", ets_model, resid_std) if ets_err < naive_err else ("naive", None, None)
+    ets_fc = ets_model.forecast(h).to_numpy() if ets_model is not None else None
+    if ets_fc is None or smape(a, ets_fc) >= smape(a, naive_fc):
+        return "naive", None, None
+    return "ets", ets_model, resid_std
 
-def forecast_series_conservative(df: pd.DataFrame, rule: str, metric: str, alpha: float = 0.05) -> pd.DataFrame:
-    steps, seasonal_periods, freq, _ = _forecast_freq_meta(rule)
-    ts = _series_from_raw(df, rule, metric).clip(lower=0)
-    model_type, ets_model, resid_std = _choose_model(ts, rule, seasonal_periods)
-    if model_type == "ets" and ets_model is not None:
-        mean_fc = ets_model.forecast(steps).to_numpy()
-        z = 1.96 if alpha == 0.05 else 1.64
+def forecast_conservative(df: pd.DataFrame, rule: str, metric: str, alpha=0.05) -> pd.DataFrame:
+    steps, seasonal_periods, freq, _ = _forecast_meta(rule)
+    ts = _series(df, rule, metric).clip(lower=0)
+    kind, ets_model, resid_std = _choose_model(ts, rule, seasonal_periods)
+    if kind == "ets" and ets_model is not None:
+        mean = ets_model.forecast(steps).to_numpy()
+        z = 1.96 if alpha==0.05 else 1.64
         band = (resid_std or 0.0) * z
-        lower = np.maximum(0.0, mean_fc - band)
-        upper = np.maximum(0.0, mean_fc + band)
+        lo, hi = np.maximum(0.0, mean-band), np.maximum(0.0, mean+band)
     else:
-        mean_fc = _seasonal_naive(ts, steps, seasonal_periods)
-        lower = np.maximum(0.0, mean_fc * 0.9)
-        upper = mean_fc * 1.1
-    lookback = min(len(ts), 28 if rule == "D" else (12 if rule == "MS" else 12))
-    recent_mean = float(ts.iloc[-lookback:].mean()) if lookback > 0 else 0.0
-    cap_lo = recent_mean * steps * 0.7
-    cap_hi = recent_mean * steps * 1.3
-    horizon_sum = float(mean_fc.sum())
-    if cap_hi > 0 and horizon_sum > cap_hi:
-        scale = cap_hi / horizon_sum
-        mean_fc *= scale; lower *= scale; upper *= scale
-    elif horizon_sum < cap_lo and horizon_sum > 0:
-        scale = cap_lo / horizon_sum
-        mean_fc *= scale; lower *= scale; upper *= scale
-    idx = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
-    return pd.DataFrame({"Date": idx, "yhat": mean_fc, "yhat_lower": lower, "yhat_upper": upper})
+        mean = _seasonal_naive(ts, steps, seasonal_periods)
+        lo, hi = np.maximum(0.0, mean*0.9), mean*1.1
 
-# ---------------------------------
-# Displays (each begins with its own local filter block)
-# ---------------------------------
-def tab_kpi_overview(raw_df: pd.DataFrame):
-    st.header("📊 KPI Overview")
-    df, _, _, _ = local_filters_block(raw_df, key_prefix="kpi")
-    if df.empty:
+    look = min(len(ts), 28 if rule=="D" else (12 if rule=="MS" else 12))
+    recent = float(ts.iloc[-look:].mean()) if look>0 else 0.0
+    cap_lo, cap_hi = recent*steps*0.7, recent*steps*1.3
+    horizon_sum = float(mean.sum())
+    if cap_hi>0 and horizon_sum>cap_hi:
+        s = cap_hi/horizon_sum; mean*=s; lo*=s; hi*=s
+    elif horizon_sum<cap_lo and horizon_sum>0:
+        s = cap_lo/horizon_sum; mean*=s; lo*=s; hi*=s
+
+    idx = pd.date_range(ts.index[-1], periods=steps+1, freq=freq)[1:]
+    return pd.DataFrame({"Date": idx, "yhat": mean, "yhat_lower": lo, "yhat_upper": hi})
+
+# ----------------------------
+# Affinity rules
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def affinity_rules(df: pd.DataFrame, key_col: str) -> pd.DataFrame:
+    scope = df.dropna(subset=["Transaction_ID", key_col]).copy()
+    scope["Transaction_ID"] = scope["Transaction_ID"].astype(str)
+    scope[key_col] = scope[key_col].astype(str)
+
+    tx_n = scope["Transaction_ID"].nunique()
+    if tx_n == 0: return pd.DataFrame()
+
+    basket_sales = scope.groupby("Transaction_ID")["Total_Sale"].sum()
+    tx_keys = scope.groupby("Transaction_ID")[key_col].apply(lambda s: tuple(sorted(set(s))))
+
+    item_counts = Counter(); pair_counts = Counter()
+    for keys in tx_keys:
+        for k in keys: item_counts[k]+=1
+        for a,b in combinations(keys,2): pair_counts[tuple(sorted((a,b)))] += 1
+    if not pair_counts: return pd.DataFrame()
+
+    item_txids_map = scope.groupby(key_col)["Transaction_ID"].apply(set)
+
+    def qty_in_txids(item: str, tx_ids: set) -> float:
+        if "Quantity" not in scope.columns or not tx_ids: return 0.0
+        v = scope[(scope["Transaction_ID"].isin(tx_ids)) & (scope[key_col]==item)]
+        return float(v["Quantity"].sum())
+
+    rows=[]
+    for (a,b), n_ab in pair_counts.items():
+        ca, cb = item_counts[a], item_counts[b]
+        supp = n_ab/tx_n
+        lift = (supp/((ca/tx_n)*(cb/tx_n))) if (ca and cb) else 0.0
+
+        tx_a, tx_b = item_txids_map.get(a,set()), item_txids_map.get(b,set())
+        co_tx = tx_a & tx_b
+        total_co = float(basket_sales.loc[list(co_tx)].sum()) if co_tx else 0.0
+        avg_co = (total_co/n_ab) if n_ab else 0.0
+
+        qa = qty_in_txids(a, co_tx); qb = qty_in_txids(b, co_tx)
+
+        rows += [
+            {"Antecedent":a,"Consequent":b,"Total Co-Baskets":n_ab,
+             "Support (A,B)":supp,"Confidence (A->B)":(n_ab/ca if ca else 0.0),
+             "Lift (A,B)":lift,"Total_Ante_Qty":qa,"Avg_Ante_Qty":(qa/n_ab if n_ab else 0.0),
+             "Total_CoBasket_Sales_Value":total_co,"Avg_CoBasket_Spend":avg_co},
+            {"Antecedent":b,"Consequent":a,"Total Co-Baskets":n_ab,
+             "Support (A,B)":supp,"Confidence (A->B)":(n_ab/cb if cb else 0.0),
+             "Lift (A,B)":lift,"Total_Ante_Qty":qb,"Avg_Ante_Qty":(qb/n_ab if n_ab else 0.0),
+             "Total_CoBasket_Sales_Value":total_co,"Avg_CoBasket_Spend":avg_co}
+        ]
+    out = pd.DataFrame(rows)
+    return out.sort_values(["Lift (A,B)","Confidence (A->B)"], ascending=[False,False]).reset_index(drop=True)
+
+# ----------------------------
+# Reusable UI blocks
+# ----------------------------
+def kpi_tile(label: str, value: str, delta: Optional[float]=None, help_text: Optional[str]=None):
+    col = st.container(border=True)
+    with col:
+        left, right = st.columns([1,1])
+        with left:
+            st.markdown(f"<span style='font-size:12px;color:#64748B' title='{help_text or ''}'>{label}</span>", unsafe_allow_html=True)
+            st.markdown(f"<div style='font-size:34px;font-weight:600;line-height:1.1'>{value}</div>", unsafe_allow_html=True)
+        with right:
+            if delta is not None:
+                color = "#22C55E" if delta >= 0 else "#EF4444"
+                arrow = "▲" if delta >= 0 else "▼"
+                st.markdown(
+                    f"<div style='text-align:right;color:{color};margin-top:6px' title='Period-over-period % change'>{arrow} {abs(delta):.1f}%</div>",
+                    unsafe_allow_html=True
+                )
+
+def glossary_expander():
+    with st.expander("ℹ️ Metric Definitions", expanded=False):
+        for k, v in GLOSSARY.items():
+            st.markdown(f"**{k}** — {v}")
+
+# ----------------------------
+# Displays
+# ----------------------------
+def view_kpi_overview(df: pd.DataFrame, prefix: str):
+    scope, rule, start, end, _ = local_filters_block(df, prefix)
+    st.subheader("📊 KPI Overview")
+    glossary_expander()
+
+    if scope.empty:
         st.info("No data for selected filters.")
         return
-    kpis = calculate_kpis(df)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Sales", f"${kpis['total_sales']:,.0f}")
-    c2.metric("Transactions", f"{kpis['tx']:,}")
-    c3.metric("Units", f"{int(kpis['total_qty']):,}")
-    c4.metric("Spend/Basket", f"${kpis['spend_per_basket']:,.2f}")
-    c5.metric("ASP", f"${kpis['asp']:,.2f}")
 
-def tab_kpi_trends(raw_df: pd.DataFrame):
-    st.header("📈 KPI Trends")
-    df, rule, _, _ = local_filters_block(raw_df, key_prefix="trend")
-    if df.empty:
+    # current period
+    now = kpis(scope)
+
+    # prior period (same length)
+    span = (pd.to_datetime(end) - pd.to_datetime(start)).days + 1
+    prior_start = pd.to_datetime(start) - pd.Timedelta(days=span)
+    prior_end = pd.to_datetime(start) - pd.Timedelta(days=1)
+    prior_scope = df[(df["Date"]>=prior_start)&(df["Date"]<=prior_end)]
+    prev = kpis(prior_scope) if not prior_scope.empty else dict(total_sales=0,total_qty=0,tx=0,spend_per_basket=0,asp=0)
+
+    def pct_delta(a,b):
+        if b == 0: return None
+        return (a-b)/b*100
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1: kpi_tile("Total Sales", f"${now['total_sales']:,.0f}", pct_delta(now['total_sales'], prev['total_sales']), GLOSSARY["Total_Sale"])
+    with c2: kpi_tile("Transactions", f"{now['tx']:,}", pct_delta(now['tx'], prev['tx']), GLOSSARY["Transactions"])
+    with c3: kpi_tile("Units", f"{int(now['total_qty']):,}", pct_delta(now['total_qty'], prev['total_qty']), GLOSSARY["Quantity"])
+    with c4: kpi_tile("Spend/Basket", f"${now['spend_per_basket']:,.2f}", pct_delta(now['spend_per_basket'], prev['spend_per_basket']), GLOSSARY["Spend per Basket"])
+    with c5: kpi_tile("ASP", f"${now['asp']:,.2f}", pct_delta(now['asp'], prev['asp']), GLOSSARY["ASP"])
+
+def view_kpi_trends(df: pd.DataFrame, prefix: str):
+    scope, rule, *_ = local_filters_block(df, prefix)
+    st.subheader("📈 KPI Trends")
+    glossary_expander()
+    if scope.empty:
         st.info("No data for selected filters.")
         return
 
-    metric = st.selectbox("Metric", ["Total_Sale", "Quantity", "Spend per Basket", "Transactions"], index=0, key="trend_metric_sel")
-    # auto-pick a split if >1 chosen in any dimension
+    metric = st.selectbox("Metric", ["Total_Sale","Quantity","Spend per Basket","Transactions"], index=0, key=f"{prefix}_trend_metric")
+    # auto pick a grouping if any filter has multiple selections
     group_dim = None
-    # Use a small chooser to explicitly select split (None / Store / Category / Brand / Item)
-    dims_available = [d for d in ["Store_ID","Category","Brand_Name","Item"] if d in df.columns]
-    group_dim = st.selectbox("Split by (optional)", ["None"] + dims_available, index=0, key="trend_split")
-    group_dim = None if group_dim == "None" else group_dim
+    for dim, sel in {
+        "Store_ID": st.session_state.get(f"{prefix}_stores", []),
+        "Category": st.session_state.get(f"{prefix}_cats", []),
+        "Brand_Name": st.session_state.get(f"{prefix}_brands", []),
+        "Item": st.session_state.get(f"{prefix}_items", []),
+    }.items():
+        if isinstance(sel, list) and len(sel) > 1:
+            group_dim = dim; break
 
-    trend_df = calculate_trends(df, rule, group_dim)
-    if trend_df.empty or metric not in trend_df.columns:
+    t = trends(scope, rule, group_dim)
+    if t.empty or metric not in t.columns or t[metric].dropna().empty:
         st.info("No trend data for current filters and metric.")
         return
 
-    fig = px.line(trend_df, x="Date", y=metric, color=group_dim, title=f"{metric} over time" + (f" by {group_dim}" if group_dim else ""))
+    fig = px.line(t, x="Date", y=metric, color=group_dim, title=f"{metric} Over Time" + (f" by {group_dim}" if group_dim else ""))
     fig.update_layout(hovermode="x unified")
-
-    aggregate_only = (group_dim is None)
-    can_forecast = aggregate_only and (metric in ["Total_Sale", "Quantity"])
-    _, _, _, horizon_label = _forecast_freq_meta(rule)
-
-    show_fc = st.checkbox(
-        f"Show {metric} forecast ({horizon_label})",
-        value=True if can_forecast else False,
-        disabled=not can_forecast,
-        key="trend_show_fc_cb"
-    )
-
-    if can_forecast and show_fc:
-        fc_df = forecast_series_conservative(df, rule=rule, metric=metric, alpha=0.05)
-        fig.add_scatter(x=fc_df["Date"], y=fc_df["yhat"], mode="lines", name=f"{metric} forecast", line=dict(dash="dash"))
-        fig.add_traces([dict(
-            x=pd.concat([fc_df["Date"], fc_df["Date"][::-1]]),
-            y=pd.concat([fc_df["yhat_upper"], fc_df["yhat_lower"][::-1]]),
-            fill="toself",
-            fillcolor="rgba(99,110,250,0.15)",
-            line=dict(color="rgba(255,255,255,0)"),
-            hoverinfo="skip",
-            name="95% interval"
-        )])
-        st.caption(
-            f"**Forecast summary ({horizon_label})** — Projected {metric.replace('_',' ').title()}: "
-            f"**{fc_df['yhat'].sum():,.0f}** "
-            f"(95% CI: {fc_df['yhat_lower'].sum():,.0f} – {fc_df['yhat_upper'].sum():,.0f})"
-        )
-        st.download_button(
-            "📥 Download forecast (CSV)",
-            data=fc_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"forecast_{metric.lower()}_{rule}.csv",
-            mime="text/csv",
-            key="dl_fc_trend"
-        )
-
     st.plotly_chart(fig, use_container_width=True)
 
-def tab_top_n(raw_df: pd.DataFrame):
-    st.header("🏆 Top-N Views")
-    df, _, _, _ = local_filters_block(raw_df, key_prefix="topn")
-    if df.empty:
+    # Aggregate forecast only (not split)
+    if (group_dim is None) and metric in ["Total_Sale","Quantity"]:
+        steps,_,_, horizon = _forecast_meta(rule)
+        show = st.checkbox(f"Show {metric} forecast ({horizon})", value=True, key=f"{prefix}_fc_show")
+        if show:
+            fc = forecast_conservative(scope, rule, metric)
+            fig2 = go.Figure()
+            # history
+            s_hist = _series(scope, rule, metric)
+            fig2.add_trace(go.Scatter(x=s_hist.index, y=s_hist.values, mode="lines", name="History"))
+            # forecast + band
+            fig2.add_trace(go.Scatter(x=fc["Date"], y=fc["yhat"], mode="lines", name="Forecast", line=dict(dash="dash")))
+            fig2.add_traces([
+                go.Scatter(x=pd.concat([fc["Date"], fc["Date"][::-1]]),
+                           y=pd.concat([fc["yhat_upper"], fc["yhat_lower"][::-1]]),
+                           fill="toself", fillcolor="rgba(99,110,250,0.15)",
+                           line=dict(color="rgba(255,255,255,0)"),
+                           hoverinfo="skip", name="95% interval")
+            ])
+            fig2.update_layout(title=f"{metric} Forecast — {horizon}", hovermode="x unified")
+            st.plotly_chart(fig2, use_container_width=True)
+            st.caption(f"**Forecast summary** — projected {metric.replace('_',' ').title()}: **{fc['yhat'].sum():,.0f}** "
+                       f"(95% CI: {fc['yhat_lower'].sum():,.0f} – {fc['yhat_upper'].sum():,.0f})")
+
+def view_topn(df: pd.DataFrame, prefix: str):
+    scope, *_ = local_filters_block(df, prefix)
+    st.subheader("🏆 Top-N Views")
+    glossary_expander()
+    if scope.empty:
         st.info("No data for selected filters.")
         return
-    dims_available = [d for d in ["Category", "Brand_Name", "Store_ID", "Item"] if d in df.columns]
-    dim = st.selectbox("Top-N by", dims_available, index=0, key="topn_dim_sel")
-    n = st.slider("N", 5, 30, 10, key="topn_n_sel")
-    top_df, y_col = calculate_top_n(df, dim, n)
-    fig_bar = px.bar(top_df, x=dim, y=y_col, title=f"Top {n} {dim} by {y_col}", text_auto=".2s")
-    st.plotly_chart(fig_bar, use_container_width=True)
 
-def tab_basket_affinity(raw_df: pd.DataFrame):
-    st.header("🧺 Targeted Basket Affinity Report")
-    st.caption("Identify items most frequently purchased alongside a selected Target at Item / Brand / Category level.")
-    df, _, _, _ = local_filters_block(raw_df, key_prefix="aff")
-    if df.empty:
-        st.info("No data for selected filters.")
-        return
+    dims = [d for d in ["Category","Brand_Name","Store_ID","Item"] if d in scope.columns]
+    c1, c2 = st.columns([1,1])
+    with c1:
+        dim = st.selectbox("Dimension", dims, index=0, key=f"{prefix}_top_dim")
+    with c2:
+        n = st.slider("N", 5, 30, 10, key=f"{prefix}_top_n")
 
-    valid_grans = [g for g in ["Item", "Brand_Name", "Category"] if g in df.columns]
-    default_index = valid_grans.index("Item") if "Item" in valid_grans else 0
-    granularity = st.radio("Granularity", valid_grans, index=default_index, horizontal=True, key="aff_granularity_sel")
-    key_col = granularity
-
-    unique_targets = sorted(df[key_col].astype(str).unique().tolist())
-    target_product = st.selectbox("Select Target", unique_targets, index=0 if unique_targets else None, key="aff_target_sel")
-    if not target_product:
-        st.warning("Please select a Target to generate the affinity report.")
-        return
-
-    all_rules_df = calculate_affinity_rules(df, key_col)
-    if all_rules_df.empty:
-        st.info("No co-basket pairs found. Try widening the date range or filters.")
-        return
-
-    target_rules_df = all_rules_df[all_rules_df["Antecedent"] == str(target_product)].copy()
-    if target_rules_df.empty:
-        st.info(f"No outbound associations found for **{target_product}**.")
-        return
-
-    target_rules_df["Associated Item"] = target_rules_df["Consequent"]
-    display_df = target_rules_df[[
-        "Associated Item",
-        "Confidence (A->B)",
-        "Lift (A,B)",
-        "Total Co-Baskets",
-        "Total_Antecedent_Qty_in_CoBasket",
-        "Avg_Antecedent_Qty_in_CoBasket",
-        "Total_CoBasket_Sales_Value",
-        "Avg_CoBasket_Spend",
-    ]].copy()
-    display_df["Confidence (%)"] = (display_df["Confidence (A->B)"] * 100.0).round(2)
-    display_df = display_df.drop(columns=["Confidence (A->B)"]).rename(columns={
-        "Lift (A,B)": "Lift",
-        "Total_Antecedent_Qty_in_CoBasket": f"Total Qty of {target_product}",
-        "Avg_Antecedent_Qty_in_CoBasket":   f"Avg Qty of {target_product}",
-        "Total_CoBasket_Sales_Value":       "Total Co-Basket Sales",
-        "Avg_CoBasket_Spend":               "Avg Co-Basket Spend",
-    })
-    display_df = display_df.sort_values(["Lift", "Confidence (%)"], ascending=False).reset_index(drop=True)
-    display_df.insert(0, "Rank", range(1, 1 + len(display_df)))
-
-    st.subheader(f"Items Associated with: {target_product}")
-    st.markdown(
-        f"**How to read:** Higher **Lift** and **Confidence** indicate stronger historical co-purchase with **{target_product}**. "
-        f"Sales metrics reflect the **entire basket** value where both items appear."
-    )
+    top_df = (scope.groupby(dim)["Total_Sale"].sum().sort_values(ascending=False).head(n).reset_index())
+    fig = px.bar(top_df, x=dim, y="Total_Sale", text_auto=".2s", title=f"Top {n} {dim} by Total Sales")
+    st.plotly_chart(fig, use_container_width=True)
     st.dataframe(
-        display_df,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Rank": st.column_config.NumberColumn("Rank", format="%d"),
-            "Associated Item": st.column_config.TextColumn("Associated Item", width="large"),
-            "Confidence (%)": st.column_config.ProgressColumn(
-                f"Confidence ({target_product} → Associated)", min_value=0, max_value=100, format="%.1f%%",
-                help=f"Share of {target_product} baskets that also contained the Associated Item."
-            ),
-            "Lift": st.column_config.NumberColumn(
-                f"Lift ({target_product}, Associated)", format="%.2f",
-                help="How much more often the pair appears together vs if independent (>1 = positive association)."
-            ),
-            "Total Co-Basket Sales": st.column_config.NumberColumn("Total Co-Basket Sales", format="$%.2f"),
-            "Avg Co-Basket Spend": st.column_config.NumberColumn("Avg Co-Basket Spend", format="$%.2f"),
-            f"Total Qty of {target_product}": st.column_config.NumberColumn(f"Total Qty of {target_product}", format="%d"),
-            f"Avg Qty of {target_product}": st.column_config.NumberColumn(f"Avg Qty of {target_product}", format="%.2f"),
-            "Total Co-Baskets": st.column_config.NumberColumn("Total Co-Baskets", format="%d"),
-        },
-        column_order=[
-            "Rank", "Associated Item", "Lift", "Confidence (%)",
-            "Total Co-Basket Sales", "Avg Co-Basket Spend",
-            f"Total Qty of {target_product}", f"Avg Qty of {target_product}",
-            "Total Co-Baskets",
-        ],
+        top_df.rename(columns={"Total_Sale":"Total Sales"}),
+        use_container_width=True, hide_index=True,
+        column_config={"Total Sales": st.column_config.NumberColumn("Total Sales", format="$%.0f", help=GLOSSARY["Total_Sale"])}
     )
 
-def tab_price_ladder(raw_df: pd.DataFrame):
-    st.header("💲 Price Ladder")
-    df, _, _, _ = local_filters_block(raw_df, key_prefix="pl")
-    if df.empty or "Unit_Price" not in df.columns:
-        st.info("No price data available.")
-        return
-    levels = [l for l in ["Item", "Brand_Name", "Category"] if l in df.columns]
-    ladder_level = st.selectbox("Price Level", levels, index=0, key="pl_level_sel")
-    sort_metric = st.selectbox("Sort by", ["Median Price", "Average Price", "Count"], index=0, key="pl_sort_sel")
-    agg = (df.groupby(ladder_level).agg(Avg_Price=("Unit_Price","mean"),
-                                        Median_Price=("Unit_Price","median"),
-                                        Count=("Unit_Price","size")).reset_index())
-    sort_col = {"Median Price":"Median_Price","Average Price":"Avg_Price","Count":"Count"}[sort_metric]
-    agg = agg.sort_values(sort_col, ascending=False)
-    fig = px.bar(agg, x=ladder_level, y="Median_Price",
-                 hover_data={"Avg_Price":":.2f","Median_Price":":.2f","Count":":,"},
-                 title=f"Price Ladder (Median) by {ladder_level}", text_auto=".2f")
-    fig.update_layout(xaxis_title=ladder_level, yaxis_title="Median Price")
-    st.plotly_chart(fig, use_container_width=True)
-    if ladder_level == "Item":
-        st.caption("Distribution of Unit_Price by Item (jittered)")
-        tmp = df.copy()
-        tmp["jitter"] = np.random.uniform(-0.2, 0.2, size=len(tmp))
-        fig_sc = px.strip(tmp, x="Item", y="Unit_Price", title="Unit Price Distribution by Item")
-        st.plotly_chart(fig_sc, use_container_width=True)
+def view_affinity(df: pd.DataFrame, prefix: str):
+    scope, *_ = local_filters_block(df, prefix)
+    st.subheader("🧺 Targeted Basket Affinity")
+    st.markdown("Higher **Lift** and **Confidence** indicate stronger historical co-purchase. Evaluate with business context.")
+    glossary_expander()
 
-def tab_store_map(raw_df: pd.DataFrame):
-    st.header("🗺️ Store Map (Hover for KPIs)")
-    df, _, _, _ = local_filters_block(raw_df, key_prefix="map")
-    needed_cols = {"Store_ID", "Store_Latitude", "Store_Longitude"}
-    if not needed_cols.issubset(df.columns):
-        st.info("Store location columns not found. Expecting Store_ID, Store_Latitude, Store_Longitude.")
-        return
-    if df.empty:
+    if scope.empty:
         st.info("No data for selected filters.")
         return
 
-    with st.expander("ℹ️ Metric Definitions", expanded=False):
-        st.markdown("""
-- **Total Sales**: Sum of `Total_Sale` within current filters.
-- **Transactions**: Count of unique `Transaction_ID`.
-- **Units**: Sum of `Quantity`.
-- **Spend/Basket**: `Total Sales ÷ Transactions`.
-- **ASP**: `Total Sales ÷ Units`.
-        """)
-
-    df_map = df.dropna(subset=["Store_Latitude", "Store_Longitude"]).copy()
-    if df_map.empty:
-        st.info("No stores with coordinates in the current filter selection.")
+    grains = [g for g in ["Item","Brand_Name","Category"] if g in scope.columns]
+    gcol = st.radio("Granularity", grains, horizontal=True, index=0, key=f"{prefix}_aff_grain")
+    universe = sorted(scope[gcol].astype(str).unique().tolist())
+    target = st.selectbox("Target", universe, index=0 if universe else None, key=f"{prefix}_aff_target")
+    if not target:
+        st.info("Select a target.")
         return
 
-    kpi_agg = (df_map.groupby("Store_ID", as_index=False)
-                    .agg(Total_Sale=("Total_Sale","sum"),
-                         Quantity=("Quantity","sum"),
-                         Transactions=("Transaction_ID","nunique")))
-    kpi_agg["Spend_per_Basket"] = np.where(kpi_agg["Transactions"]>0,
-                                           kpi_agg["Total_Sale"]/kpi_agg["Transactions"],0.0)
-    kpi_agg["ASP"] = np.where(kpi_agg["Quantity"]>0,
-                              kpi_agg["Total_Sale"]/kpi_agg["Quantity"],0.0)
+    rules = affinity_rules(scope, gcol)
+    if rules.empty:
+        st.info("No co-basket pairs found.")
+        return
 
-    loc_cols = ["Store_ID","Store_City","Store_State","Store_Latitude","Store_Longitude"]
-    locs = df_map[[c for c in loc_cols if c in df_map.columns]].drop_duplicates(subset=["Store_ID"])
-    store_kpis = kpi_agg.merge(locs, on="Store_ID", how="left")
+    out = rules[rules["Antecedent"]==str(target)].copy()
+    if out.empty:
+        st.info(f"No associations for {target}.")
+        return
 
-    if {"Store_City", "Store_State"}.issubset(store_kpis.columns):
-        store_kpis["Store_Label"] = (store_kpis["Store_ID"].astype(str) + " — " +
-                                     store_kpis["Store_City"].astype(str) + ", " +
-                                     store_kpis["Store_State"].astype(str))
+    out["Associated Item"] = out["Consequent"]
+    out["Confidence (%)"] = (out["Confidence (A->B)"]*100).round(2)
+    out = (out.rename(columns={"Lift (A,B)":"Lift",
+                               "Total_CoBasket_Sales_Value":"Total Co-Basket Sales",
+                               "Avg_CoBasket_Spend":"Avg Co-Basket Spend",
+                               "Total_Ante_Qty":f"Total Qty of {target}",
+                               "Avg_Ante_Qty":f"Avg Qty of {target}"})
+              [["Associated Item","Lift","Confidence (%)","Total Co-Baskets",
+                f"Total Qty of {target}", f"Avg Qty of {target}",
+                "Total Co-Basket Sales","Avg Co-Basket Spend"]])
+
+    out = out.sort_values(["Lift","Confidence (%)"], ascending=[False,False]).reset_index(drop=True)
+    out.insert(0,"Rank", range(1,1+len(out)))
+
+    colconf = {
+        "Rank": st.column_config.NumberColumn("Rank", format="%d"),
+        "Associated Item": st.column_config.TextColumn("Associated"),
+        "Lift": st.column_config.NumberColumn("Lift", format="%.2f", help=GLOSSARY["Lift"]),
+        "Confidence (%)": st.column_config.NumberColumn("Confidence (%)", format="%.2f", help=GLOSSARY["Confidence (%)"]),
+        "Total Co-Baskets": st.column_config.NumberColumn("Total Co-Baskets", format="%d", help="Count of baskets where both items co-occur."),
+        f"Total Qty of {target}": st.column_config.NumberColumn(f"Total Qty of {target}", format="%d"),
+        f"Avg Qty of {target}": st.column_config.NumberColumn(f"Avg Qty of {target}", format="%.2f"),
+        "Total Co-Basket Sales": st.column_config.NumberColumn("Total Co-Basket Sales", format="$%.0f", help=GLOSSARY["Avg Co-Basket Spend"]),
+        "Avg Co-Basket Spend": st.column_config.NumberColumn("Avg Co-Basket Spend", format="$%.2f", help=GLOSSARY["Avg Co-Basket Spend"]),
+    }
+    st.dataframe(out, hide_index=True, use_container_width=True, column_config=colconf)
+
+def view_price_ladder(df: pd.DataFrame, prefix: str):
+    scope, *_ = local_filters_block(df, prefix)
+    st.subheader("💲 Price Ladder")
+    glossary_expander()
+    if scope.empty:
+        st.info("No data for selected filters.")
+        return
+
+    if "Unit_Price" not in scope.columns:
+        st.info("No unit price data present.")
+        return
+
+    levels = [l for l in ["Item","Brand_Name","Category"] if l in scope.columns]
+    c1, c2 = st.columns([1,1])
+    with c1: lvl = st.selectbox("Level", levels, index=0, key=f"{prefix}_pl_level")
+    with c2: sort_by = st.selectbox("Sort by", ["Median Price","Average Price","Count"], index=0, key=f"{prefix}_pl_sort")
+
+    agg = (scope.groupby(lvl)
+                .agg(Avg_Price=("Unit_Price","mean"),
+                     Median_Price=("Unit_Price","median"),
+                     Count=("Unit_Price","size"))
+                .reset_index())
+
+    sort_col = {"Median Price":"Median_Price","Average Price":"Avg_Price","Count":"Count"}[sort_by]
+    agg = agg.sort_values(sort_col, ascending=False)
+
+    fig = px.bar(agg, x=lvl, y="Median_Price", text_auto=".2f", title=f"Median Price by {lvl}",
+                 hover_data={"Avg_Price":":.2f","Median_Price":":.2f","Count":":,"})
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(
+        agg.rename(columns={"Avg_Price":"Average Price","Median_Price":"Median Price"}),
+        use_container_width=True, hide_index=True,
+        column_config={
+            lvl: st.column_config.TextColumn(lvl.replace("_"," ")),
+            "Median Price": st.column_config.NumberColumn("Median Price", format="$%.2f", help=GLOSSARY["Median_Unit_Price"]),
+            "Average Price": st.column_config.NumberColumn("Average Price", format="$%.2f"),
+            "Count": st.column_config.NumberColumn("Observations", format="%d")
+        }
+    )
+
+def view_store_map(df: pd.DataFrame, prefix: str):
+    scope, *_ = local_filters_block(df, prefix)
+    st.subheader("🗺️ Store Map")
+    st.caption("Size = Total Sales | Color = ASP or Spend/Basket. Hover markers for full KPIs.")
+    glossary_expander()
+
+    need = {"Store_ID","Store_Latitude","Store_Longitude"}
+    if (scope.empty) or (not need.issubset(scope.columns)):
+        st.info("Map requires Store_ID, Store_Latitude, Store_Longitude and some data.")
+        return
+
+    m = (scope.groupby("Store_ID", as_index=False)
+               .agg(Total_Sale=("Total_Sale","sum"),
+                    Quantity=("Quantity","sum"),
+                    Transactions=("Transaction_ID","nunique")))
+    m["Spend_per_Basket"] = np.where(m["Transactions"]>0, m["Total_Sale"]/m["Transactions"], 0.0)
+    m["ASP"] = np.where(m["Quantity"]>0, m["Total_Sale"]/m["Quantity"], 0.0)
+
+    loc_cols = [c for c in ["Store_ID","Store_City","Store_State","Store_Latitude","Store_Longitude"] if c in scope.columns]
+    locs = scope[loc_cols].drop_duplicates(subset=["Store_ID"])
+    store = m.merge(locs, on="Store_ID", how="left")
+    if {"Store_City","Store_State"}.issubset(store.columns):
+        store["Store_Label"] = store["Store_ID"].astype(str)+" — "+store["Store_City"].astype(str)+", "+store["Store_State"].astype(str)
     else:
-        store_kpis["Store_Label"] = store_kpis["Store_ID"].astype(str)
+        store["Store_Label"] = store["Store_ID"].astype(str)
 
-    col1, col2 = st.columns([1, 1])
-    size_metric = col1.selectbox("Bubble Size", ["Total_Sale","Transactions","Quantity"], index=0, key="map_size_sel")
-    color_metric = col2.selectbox("Bubble Color", ["Total_Sale","Spend_per_Basket","ASP","Transactions","Quantity"], index=0, key="map_color_sel")
+    c1,c2 = st.columns([1,1])
+    with c1:
+        size_metric = st.selectbox("Bubble Size", ["Total_Sale","Transactions","Quantity"], index=0, key=f"{prefix}_map_size")
+    with c2:
+        color_metric = st.selectbox("Bubble Color", ["Total_Sale","Spend_per_Basket","ASP","Transactions","Quantity"], index=1, key=f"{prefix}_map_color")
 
     fig = px.scatter_mapbox(
-        store_kpis, lat="Store_Latitude", lon="Store_Longitude",
+        store, lat="Store_Latitude", lon="Store_Longitude",
         size=size_metric, color=color_metric, size_max=28,
-        zoom=3, center={"lat":39.5, "lon":-98.35},
+        zoom=3, center={"lat":39.5,"lon":-98.35}, mapbox_style="open-street-map",
         hover_name="Store_Label",
         custom_data=np.stack([
-            store_kpis["Total_Sale"].values,
-            store_kpis["Transactions"].values,
-            store_kpis["Quantity"].values,
-            store_kpis["Spend_per_Basket"].values,
-            store_kpis["ASP"].values,
-        ], axis=-1),
-        mapbox_style="open-street-map", title=None
+            store["Total_Sale"].values, store["Transactions"].values, store["Quantity"].values,
+            store["Spend_per_Basket"].values, store["ASP"].values
+        ], axis=-1)
     )
     fig.update_traces(
         hovertemplate=(
-            "<b>%{hovertext}</b><br>"
-            "Total Sales: $%{customdata[0]:,.0f}<br>"
-            "Transactions: %{customdata[1]:,}<br>"
-            "Units: %{customdata[2]:,}<br>"
-            "Spend/Basket: $%{customdata[3]:,.2f}<br>"
-            "ASP: $%{customdata[4]:,.2f}<br>"
+            "<b>%{hovertext}</b><br>" +
+            "Total Sales: $%{customdata[0]:,.0f}<br>" +
+            "Transactions: %{customdata[1]:,}<br>" +
+            "Units: %{customdata[2]:,}<br>" +
+            "Spend/Basket: $%{customdata[3]:,.2f}<br>" +
+            "ASP: $%{customdata[4]:,.2f}<br>" +
             "<extra></extra>"
         )
     )
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=600)
-    st.plotly_chart(fig, use_container_width=True, key=f"store_map_{size_metric}_{color_metric}")
+    fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=560)
+    st.plotly_chart(fig, use_container_width=True)
 
-def tab_assortment_space(raw_df: pd.DataFrame):
-    st.header("📦 Assortment & Space Optimization")
-    df, _, start_date, end_date = local_filters_block(raw_df, key_prefix="aso")
-    if df.empty:
+def view_assortment_space(df: pd.DataFrame, prefix: str):
+    scope, rule, start, end, _ = local_filters_block(df, prefix)
+    st.subheader("📦 Assortment & Space Optimization")
+    st.markdown(
+        """
+        *How to use:* Start with **SKU Productivity** to see velocity & distribution;  
+        use **Rationalization** to flag low-velocity, low-share, or price-tier duplicates;  
+        scan **Opportunity Map** for over/under-index by geo; finish with **New Item Tracker** vs benchmarks.
+        """
+    )
+    glossary_expander()
+
+    if scope.empty:
         st.info("No data for selected filters.")
         return
 
-    def _weeks_in_range(df_in: pd.DataFrame) -> int:
+    # --- Local helpers
+    def weeks_in_range(sdf):
         try:
-            n = df_in.set_index("Date").resample("W-SUN")["Total_Sale"].sum().shape[0]
-            return max(int(n), 1)
+            return max(int(sdf.set_index("Date").resample("W-SUN")["Total_Sale"].sum().shape[0]),1)
         except Exception:
-            span_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days
-            return max(int(np.ceil(span_days/7.0)), 1)
+            span=(pd.to_datetime(end)-pd.to_datetime(start)).days
+            return max(int(np.ceil(span/7.0)),1)
 
-    n_weeks = _weeks_in_range(df)
-    price_col = "Unit_Price" if "Unit_Price" in df.columns else None
+    n_weeks = weeks_in_range(scope)
+    price_col = "Unit_Price" if "Unit_Price" in scope.columns else None
 
-    # --- A) SKU Productivity ---
-    st.subheader("A) SKU Productivity Report")
-    prod_dim_options = [c for c in ["Item","Brand_Name"] if c in df.columns and df[c].notna().any()]
-    if not prod_dim_options:
-        st.info("No valid SKU fields (Item/Brand_Name).")
-        return
-    with st.expander("Controls — Productivity", expanded=True):
-        prod_dim = st.selectbox("Granularity", options=prod_dim_options, index=0, key="aso_prod_dim_sel")
-        can_price = bool(price_col)
-        show_price = st.checkbox("Show median Unit Price column", value=True if can_price else False, disabled=not can_price, key="aso_prod_price_cb")
+    # A) Productivity
+    st.markdown("### A) SKU Productivity")
+    dim_opts = [c for c in ["Item","Brand_Name"] if c in scope.columns and scope[c].notna().any()]
+    prod_dim = st.selectbox("Granularity", dim_opts, index=0, key=f"{prefix}_prod_dim")
+    show_price = st.checkbox("Show median Unit Price", value=True if price_col else False, disabled=not price_col, key=f"{prefix}_prod_price")
 
-    sku_store = df.groupby([prod_dim,"Store_ID"], dropna=False)["Total_Sale"].sum().reset_index()
+    sku_store = (scope.groupby([prod_dim,"Store_ID"], dropna=False)["Total_Sale"].sum().reset_index())
     active_stores = sku_store.groupby(prod_dim)["Store_ID"].nunique().rename("Active_Stores")
-    if "Category" not in df.columns:
-        st.info("Category column missing; cannot compute % of category sales.")
+    if "Category" not in scope.columns:
+        st.info("Category missing.")
         return
-    sku_sales = df.groupby([prod_dim,"Category"], dropna=False)["Total_Sale"].sum().rename("SKU_Sales")
-    cat_sales = df.groupby("Category", dropna=False)["Total_Sale"].sum().rename("Category_Sales")
 
-    prod_df = sku_sales.reset_index().merge(active_stores, on=prod_dim, how="left")
-    prod_df["Active_Stores"] = prod_df["Active_Stores"].fillna(0).astype(int)
-    prod_df["Weeks"] = n_weeks
-    prod_df["Velocity_$/SKU/Store/Week"] = np.where(
-        (prod_df["Active_Stores"]>0) & (prod_df["Weeks"]>0),
-        prod_df["SKU_Sales"]/(prod_df["Active_Stores"]*prod_df["Weeks"]),
-        0.0
+    sku_sales = scope.groupby([prod_dim,"Category"], dropna=False)["Total_Sale"].sum().rename("SKU_Sales")
+    cat_sales = scope.groupby("Category", dropna=False)["Total_Sale"].sum().rename("Category_Sales")
+
+    prod = sku_sales.reset_index().merge(active_stores, on=prod_dim, how="left")
+    prod["Active_Stores"] = prod["Active_Stores"].fillna(0).astype(int)
+    prod["Weeks"] = n_weeks
+    prod["Velocity_$/SKU/Store/Week"] = np.where(
+        (prod["Active_Stores"]>0)&(prod["Weeks"]>0),
+        prod["SKU_Sales"]/(prod["Active_Stores"]*prod["Weeks"]), 0.0
     )
-    prod_df = prod_df.merge(cat_sales.reset_index(), on="Category", how="left")
-    prod_df["% of Category Sales"] = np.where(
-        prod_df["Category_Sales"]>0,
-        100.0*prod_df["SKU_Sales"]/prod_df["Category_Sales"],
-        0.0
-    )
-    if not prod_df.empty:
-        prod_df["Velocity_Rank_in_Category"] = (
-            prod_df.groupby("Category")["Velocity_$/SKU/Store/Week"].rank(ascending=False, method="dense").astype(int)
+    prod = prod.merge(cat_sales.reset_index(), on="Category", how="left")
+    prod["% of Category Sales"] = np.where(prod["Category_Sales"]>0, 100*prod["SKU_Sales"]/prod["Category_Sales"], 0.0)
+    if not prod.empty:
+        prod["Velocity_Rank_in_Category"] = (
+            prod.groupby("Category")["Velocity_$/SKU/Store/Week"].rank(ascending=False, method="dense").astype(int)
         )
 
     if price_col and show_price:
-        med_price = df.groupby(prod_dim)[price_col].median().rename("Median_Unit_Price")
-        prod_df = prod_df.merge(med_price.reset_index(), on=prod_dim, how="left")
+        med_price = scope.groupby(prod_dim)[price_col].median().rename("Median_Unit_Price")
+        prod = prod.merge(med_price.reset_index(), on=prod_dim, how="left")
 
-    meta_cols = []
-    if prod_dim != "Brand_Name" and "Brand_Name" in df.columns: meta_cols.append("Brand_Name")
-    if prod_dim != "Item" and "Item" in df.columns: meta_cols.append("Item")
-    for c in meta_cols:
-        try:
-            top_map = (df.groupby([prod_dim,c])["Total_Sale"].sum().reset_index()
-                         .sort_values([prod_dim,"Total_Sale"], ascending=[True,False])
-                         .drop_duplicates(subset=[prod_dim])[[prod_dim,c]])
-            prod_df = prod_df.merge(top_map, on=prod_dim, how="left")
-        except Exception:
-            pass
+    # attach complementary label
+    if prod_dim=="Item" and "Brand_Name" in scope.columns:
+        lab = (scope.groupby(["Item","Brand_Name"])["Total_Sale"].sum().reset_index()
+                   .sort_values(["Item","Total_Sale"], ascending=[True,False])
+                   .drop_duplicates(subset=["Item"])[["Item","Brand_Name"]])
+        prod = prod.merge(lab, on="Item", how="left")
+    elif prod_dim=="Brand_Name" and "Item" in scope.columns:
+        lab = (scope.groupby(["Brand_Name","Item"])["Total_Sale"].sum().reset_index()
+                   .sort_values(["Brand_Name","Total_Sale"], ascending=[True,False])
+                   .drop_duplicates(subset=["Brand_Name"])[["Brand_Name","Item"]])
+        prod = prod.merge(lab, on="Brand_Name", how="left")
 
-    show_cols = [prod_dim, "Category", "Active_Stores", "Weeks",
-                 "Velocity_$/SKU/Store/Week", "SKU_Sales", "Category_Sales",
-                 "% of Category Sales", "Velocity_Rank_in_Category"]
-    if "Median_Unit_Price" in prod_df.columns and show_price:
-        show_cols.insert(1, "Median_Unit_Price")
-    for c in ["Brand_Name","Item"]:
-        if c in prod_df.columns and c not in show_cols:
-            show_cols.append(c)
+    # show
+    order_cols = [c for c in [prod_dim, "Brand_Name" if prod_dim=="Item" else "Item", "Category",
+                              "Active_Stores","Weeks","Velocity_$/SKU/Store/Week","SKU_Sales",
+                              "Category_Sales","% of Category Sales","Velocity_Rank_in_Category",
+                              "Median_Unit_Price"] if c in prod.columns]
+    prod_view = prod[order_cols].sort_values(["Category","Velocity_$/SKU/Store/Week"], ascending=[True,False]).reset_index(drop=True)
 
-    prod_df_view = prod_df[[c for c in show_cols if c in prod_df.columns]].copy()
-    prod_df_view = prod_df_view.loc[:, ~prod_df_view.columns.duplicated()]
-    prod_df_view = prod_df_view.sort_values(["Category","Velocity_$/SKU/Store/Week"], ascending=[True,False]).reset_index(drop=True)
-
-    # Column helps
-    id_label = "Item" if prod_dim == "Item" else "Brand"
-    st.dataframe(
-        prod_df_view,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            prod_dim: st.column_config.TextColumn(id_label, help="SKU grain used in this table."),
-            "Category": st.column_config.TextColumn("Category", help="Product category of the SKU."),
-            "Active_Stores": st.column_config.NumberColumn("Active Stores", format="%d", help="Stores where the SKU sold at least once in the period."),
-            "Weeks": st.column_config.NumberColumn("Weeks", format="%d", help="Anchored weekly buckets in the selected range."),
-            "Velocity_$/SKU/Store/Week": st.column_config.NumberColumn("Velocity ($/SKU/store/week)", format="$%.2f",
-                                                                        help="SKU_Sales ÷ Active_Stores ÷ Weeks."),
-            "SKU_Sales": st.column_config.NumberColumn("SKU Sales", format="$%.0f"),
-            "Category_Sales": st.column_config.NumberColumn("Category Sales", format="$%.0f"),
-            "% of Category Sales": st.column_config.ProgressColumn("% of Category Sales", min_value=0, max_value=100, format="%.2f%%"),
-            "Velocity_Rank_in_Category": st.column_config.NumberColumn("Rank in Category", format="%d", help="Dense rank by Velocity within Category."),
-            "Median_Unit_Price": st.column_config.NumberColumn("Median Unit Price", format="$%.2f")
-        }
-    )
-
-    st.download_button(
-        "📥 Download SKU Productivity (CSV)",
-        data=prod_df_view.to_csv(index=False).encode("utf-8"),
-        file_name="sku_productivity.csv",
-        mime="text/csv",
-        key="dl_aso_prod"
-    )
+    colcfg = {
+        prod_dim: st.column_config.TextColumn(prod_dim.replace("_"," "), help="SKU grain used in this view."),
+        "Brand_Name": st.column_config.TextColumn("Brand", help="Brand most associated with the item."),
+        "Item": st.column_config.TextColumn("Item", help="Top-selling item within brand."),
+        "Category": st.column_config.TextColumn("Category", help="Product category."),
+        "Active_Stores": st.column_config.NumberColumn("Active Stores", format="%d", help="Stores where SKU sold ≥1 time."),
+        "Weeks": st.column_config.NumberColumn("Weeks", format="%d", help="Anchored weekly buckets in range."),
+        "Velocity_$/SKU/Store/Week": st.column_config.NumberColumn("Velocity ($/SKU/store/week)", format="$%.2f", help=GLOSSARY["Velocity_$/SKU/Store/Week"]),
+        "SKU_Sales": st.column_config.NumberColumn("SKU Sales", format="$%.0f", help="Sales of this SKU in range."),
+        "Category_Sales": st.column_config.NumberColumn("Category Sales", format="$%.0f", help="Total category sales in range."),
+        "% of Category Sales": st.column_config.NumberColumn("% of Category Sales", format="%.2f", help=GLOSSARY["% of Category Sales"]),
+        "Velocity_Rank_in_Category": st.column_config.NumberColumn("Rank in Category", format="%d", help=GLOSSARY["Velocity_Rank_in_Category"]),
+        "Median_Unit_Price": st.column_config.NumberColumn("Median Unit Price", format="$%.2f", help=GLOSSARY["Median_Unit_Price"]),
+    }
+    st.dataframe(prod_view, hide_index=True, use_container_width=True, column_config=colcfg)
 
     st.divider()
 
-    # --- B) SKU Rationalization ---
-    st.subheader("B) SKU Rationalization Tool")
-    st.markdown(
-        """
-        <div style="margin-top:-6px;margin-bottom:8px;">
-        <em>How to use:</em> Set thresholds for <b>low velocity</b> (percentile), minimum <b>category share</b>, and optional <b>similar price-tier</b> redundancy within brand+category.  
-        <br><em>Interpretation:</em> A SKU is flagged if any of these are true. Sort the table to prioritize action.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-    with st.expander("Controls — Rationalization", expanded=True):
-        perc = st.slider("Low Velocity threshold (percentile)", 5, 50, 25, step=5, key="aso_lowvel_pct_sel")
-        share_min = st.number_input("Minimum Category Share to avoid flag (%, e.g., 1.0)", min_value=0.0, max_value=100.0, value=1.0, step=0.5, key="aso_share_min_num")
-        price_var = st.slider("Price tier proximity for redundancy (± % of median Unit Price)", 1, 30, 10, step=1, key="aso_price_band_sel")
-        show_only_flagged = st.checkbox("Show only flagged SKUs", value=True, key="aso_rat_flagged_only_cb")
+    # B) Rationalization
+    st.markdown("### B) SKU Rationalization")
+    st.caption("Flagging rules: Low Velocity (percentile), Low Share (min %), Similar Price-Tier Duplicate within Brand+Category.")
+    p1,p2,p3,p4 = st.columns([1,1,1,1])
+    with p1:
+        perc = st.slider("Low Velocity percentile", 5, 50, 25, step=5, key=f"{prefix}_rat_pct")
+    with p2:
+        share_min = st.number_input("Min Category Share (%)", min_value=0.0, max_value=100.0, value=1.0, step=0.5, key=f"{prefix}_rat_share")
+    with p3:
+        price_band = st.slider("Similar Price Tier (±%)", 1, 30, 10, step=1, key=f"{prefix}_rat_band")
+    with p4:
+        only_flagged = st.checkbox("Show only flagged", value=True, key=f"{prefix}_rat_only")
 
-    rat_df = prod_df.copy()
-    rat_df["Low_Velocity_Flag"] = False
-    for cat, grp in rat_df.groupby("Category"):
+    rat = prod.copy()
+    rat["Low_Velocity_Flag"] = False
+    for cat, grp in rat.groupby("Category"):
         cutoff = np.percentile(grp["Velocity_$/SKU/Store/Week"], perc) if len(grp) else 0.0
-        idx = rat_df["Category"] == cat
-        rat_df.loc[idx, "Low_Velocity_Flag"] = rat_df.loc[idx, "Velocity_$/SKU/Store/Week"] <= cutoff
-    rat_df["Low_Share_Flag"] = rat_df["% of Category Sales"] < share_min
+        idx = rat["Category"]==cat
+        rat.loc[idx,"Low_Velocity_Flag"] = rat.loc[idx,"Velocity_$/SKU/Store/Week"] <= cutoff
 
-    if price_col and "Median_Unit_Price" in rat_df.columns and "Brand_Name" in rat_df.columns:
-        base = rat_df.copy()
-        base["Redundancy_Group"] = base["Brand_Name"].astype(str) + " | " + base["Category"].astype(str)
-        def _redundant_group(g):
+    rat["Low_Share_Flag"] = rat["% of Category Sales"] < share_min
+
+    if price_col and "Median_Unit_Price" in rat.columns and "Brand_Name" in rat.columns:
+        base = rat.copy()
+        base["Group"] = base["Brand_Name"].astype(str)+" | "+base["Category"].astype(str)
+        def _mark(g):
             med = g["Median_Unit_Price"].median()
-            band_lo = med * (1 - price_var/100.0)
-            band_hi = med * (1 + price_var/100.0)
-            g["Similar_Price_Tier"] = g["Median_Unit_Price"].between(band_lo, band_hi)
+            lo, hi = med*(1-price_band/100), med*(1+price_band/100)
+            g["Similar_Price_Tier"] = g["Median_Unit_Price"].between(lo,hi)
             return g
-        base = base.groupby("Redundancy_Group", group_keys=False).apply(_redundant_group)
-        grp_size = base.groupby("Redundancy_Group")["SKU_Sales"].transform("size")
-        base["Redundant_Candidate"] = (grp_size > 1) & base["Similar_Price_Tier"] & base["Low_Share_Flag"]
-        rat_df = base
+        base = base.groupby("Group", group_keys=False).apply(_mark)
+        grp_size = base.groupby("Group")["SKU_Sales"].transform("size")
+        base["Redundant_Candidate"] = (grp_size>1) & base["Similar_Price_Tier"] & base["Low_Share_Flag"]
+        rat = base
     else:
-        rat_df["Redundancy_Group"] = (rat_df.get("Brand_Name", "").astype(str) + " | " + rat_df["Category"].astype(str))
-        rat_df["Similar_Price_Tier"] = False
-        rat_df["Redundant_Candidate"] = False
+        rat["Similar_Price_Tier"] = False
+        rat["Redundant_Candidate"] = False
 
-    rat_df["Rationalize?"] = rat_df["Low_Velocity_Flag"] | rat_df["Low_Share_Flag"] | rat_df["Redundant_Candidate"]
+    rat["Rationalize?"] = rat["Low_Velocity_Flag"] | rat["Low_Share_Flag"] | rat["Redundant_Candidate"]
+    view = rat[rat["Rationalize?"]] if only_flagged else rat
 
-    total_skus = int(rat_df.shape[0])
-    flagged_count = int(rat_df["Rationalize?"].sum())
-    pct_flagged = (flagged_count / total_skus * 100.0) if total_skus else 0.0
-    c1, c2, c3 = st.columns(3)
-    c1.metric("SKUs evaluated", f"{total_skus:,}")
-    c2.metric("Flagged SKUs", f"{flagged_count:,}")
-    c3.metric("% Flagged", f"{pct_flagged:.1f}%")
-
-    flagged = rat_df[rat_df["Rationalize?"]].copy()
-    if not flagged.empty:
-        reason_counts = pd.DataFrame({
-            "Reason": ["Low Velocity", "Low Share", "Similar Price-Tier Duplicate"],
-            "Count": [
-                int(flagged["Low_Velocity_Flag"].sum()),
-                int(flagged["Low_Share_Flag"].sum()),
-                int(flagged["Redundant_Candidate"].sum())
-            ]
-        })
-        fig_reason = px.bar(reason_counts, x="Reason", y="Count", title="Flag Reasons (count)", text_auto=True)
-        st.plotly_chart(fig_reason, use_container_width=True)
-    else:
-        st.info("No SKUs are currently flagged with the selected thresholds.")
-
-    view_df = flagged if show_only_flagged else rat_df
-    # safe columns (avoid duplicates)
-    rat_cols = [
-        prod_dim, "Brand_Name", "Item", "Category",
-        "Median_Unit_Price", "Velocity_$/SKU/Store/Week",
-        "% of Category Sales", "Velocity_Rank_in_Category",
-        "Low_Velocity_Flag", "Low_Share_Flag", "Redundant_Candidate", "Rationalize?"
-    ]
-    rat_cols = [c for c in rat_cols if c in view_df.columns]
-    view_df = view_df[rat_cols].copy()
-    view_df = view_df.loc[:, ~view_df.columns.duplicated()]
-    view_df = view_df.sort_values(["Rationalize?","Category","Velocity_$/SKU/Store/Week"], ascending=[False,True,True]).reset_index(drop=True)
-
-    id_label = "Item" if prod_dim == "Item" else "Brand"
-    st.dataframe(
-        view_df,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            prod_dim: st.column_config.TextColumn(id_label, help="SKU grain used in this view (Item or Brand)."),
-            "Brand_Name": st.column_config.TextColumn("Brand", help="Brand associated with the SKU (when viewing by Item)."),
-            "Item": st.column_config.TextColumn("Item", help="Top-selling item for the brand (when viewing by Brand)."),
-            "Category": st.column_config.TextColumn("Category", help="Product category."),
-            "Median_Unit_Price": st.column_config.NumberColumn("Median Unit Price", format="$%.2f"),
-            "Velocity_$/SKU/Store/Week": st.column_config.NumberColumn("Velocity ($/SKU/store/week)", format="$%.2f"),
-            "% of Category Sales": st.column_config.NumberColumn("% of Category Sales", format="%.2f"),
-            "Velocity_Rank_in_Category": st.column_config.NumberColumn("Rank in Category", format="%d"),
-            "Low_Velocity_Flag": st.column_config.CheckboxColumn("Low Velocity"),
-            "Low_Share_Flag": st.column_config.CheckboxColumn("Low Share"),
-            "Redundant_Candidate": st.column_config.CheckboxColumn("Similar Price-Tier Duplicate"),
-            "Rationalize?": st.column_config.CheckboxColumn("Flag"),
-        }
+    keep = [c for c in [
+        prod_dim, "Brand_Name","Item","Category","Median_Unit_Price",
+        "Velocity_$/SKU/Store/Week","% of Category Sales","Velocity_Rank_in_Category",
+        "Low_Velocity_Flag","Low_Share_Flag","Similar_Price_Tier","Redundant_Candidate","Rationalize?"
+    ] if c in view.columns]
+    view = view[keep].loc[:, ~pd.Index(keep).duplicated()].sort_values(
+        ["Rationalize?","Category","Velocity_$/SKU/Store/Week"], ascending=[False,True,True]
     )
-    st.download_button(
-        "📥 Download Rationalization Output (CSV)",
-        data=view_df.to_csv(index=False).encode("utf-8"),
-        file_name="sku_rationalization.csv",
-        mime="text/csv",
-        key="dl_aso_rat"
-    )
+
+    colcfg2 = {
+        prod_dim: st.column_config.TextColumn(prod_dim, help="SKU grain used here."),
+        "Brand_Name": st.column_config.TextColumn("Brand"),
+        "Item": st.column_config.TextColumn("Item"),
+        "Category": st.column_config.TextColumn("Category"),
+        "Median_Unit_Price": st.column_config.NumberColumn("Median Unit Price", format="$%.2f", help=GLOSSARY["Median_Unit_Price"]),
+        "Velocity_$/SKU/Store/Week": st.column_config.NumberColumn("Velocity ($/SKU/store/week)", format="$%.2f", help=GLOSSARY["Velocity_$/SKU/Store/Week"]),
+        "% of Category Sales": st.column_config.NumberColumn("% of Category Sales", format="%.2f", help=GLOSSARY["% of Category Sales"]),
+        "Velocity_Rank_in_Category": st.column_config.NumberColumn("Rank in Category", format="%d", help=GLOSSARY["Velocity_Rank_in_Category"]),
+        "Low_Velocity_Flag": st.column_config.CheckboxColumn("Low Velocity"),
+        "Low_Share_Flag": st.column_config.CheckboxColumn("Low Share"),
+        "Similar_Price_Tier": st.column_config.CheckboxColumn("Similar Price Tier"),
+        "Redundant_Candidate": st.column_config.CheckboxColumn("Price-Tier Duplicate"),
+        "Rationalize?": st.column_config.CheckboxColumn("Flag"),
+    }
+    st.dataframe(view, hide_index=True, use_container_width=True, column_config=colcfg2)
 
     st.divider()
 
-    # --- C) Opportunity Map ---
-    st.subheader("C) Assortment Opportunity Map")
-    st.markdown(
-        """
-        <div style="margin-top:-6px;margin-bottom:8px;">
-        <em>How to use:</em> Choose geography & product grain. We compare each geo’s share to overall to compute an <b>Index</b>.  
-        <br><em>Interpretation:</em> Index &gt; 100 = over-indexing; Index &lt; 100 = under-indexing.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-    geo_cols_all = [c for c in ["Store_State","Store_City","Store_ID"] if c in df.columns]
-    if not geo_cols_all:
-        st.info("No geography columns found (need Store_State/Store_City/Store_ID).")
-        return
+    # C) Opportunity Map
+    st.markdown("### C) Assortment Opportunity Map")
+    geo_cols = [c for c in ["Store_State","Store_City","Store_ID"] if c in scope.columns]
+    if not geo_cols:
+        st.info("No geography columns found.")
+    else:
+        geo = st.selectbox("Geo", geo_cols, index=0, key=f"{prefix}_opp_geo")
+        dim = st.selectbox("Analyze by", [c for c in ["Item","Brand_Name"] if c in scope.columns], index=0, key=f"{prefix}_opp_dim")
+        topn = st.slider("Top-N per geo", 3, 15, 5, key=f"{prefix}_opp_n")
 
-    with st.expander("Controls — Opportunity Map", expanded=True):
-        geo_col = st.selectbox("Geo Dimension", options=geo_cols_all, index=0, key="aso_geo_sel")
-        map_dim = st.selectbox("Analyze by", options=[c for c in ["Item","Brand_Name"] if c in df.columns], index=0, key="aso_geo_dim_sel")
-        topn_geo = st.slider("Top-N by Geo (highest over-index)", 3, 15, 5, key="aso_geo_topn_sel")
+        overall = scope.groupby(dim)["Total_Sale"].sum().rename("Overall_Sales")
+        overall_total = overall.sum()
+        overall_share = (overall/overall_total).rename("Overall_Share").reset_index()
 
-    overall_sales = df.groupby(map_dim)["Total_Sale"].sum().rename("Overall_Sales")
-    overall_total = overall_sales.sum()
-    overall_share = (overall_sales / overall_total).rename("Overall_Share").reset_index()
+        geo_sales = scope.groupby([geo, dim])["Total_Sale"].sum().rename("Geo_Sales").reset_index()
+        geo_tot = scope.groupby(geo)["Total_Sale"].sum().rename("Geo_Total").reset_index()
 
-    geo_sales = df.groupby([geo_col, map_dim])["Total_Sale"].sum().rename("Geo_Sales").reset_index()
-    geo_totals = df.groupby(geo_col)["Total_Sale"].sum().rename("Geo_Total").reset_index()
-    geo_share = geo_sales.merge(geo_totals, on=geo_col, how="left")
-    geo_share["Geo_Share"] = np.where(geo_share["Geo_Total"]>0, geo_share["Geo_Sales"]/geo_share["Geo_Total"], 0.0)
-    geo_share = geo_share.merge(overall_share, on=map_dim, how="left")
-    geo_share["Index_vs_Overall"] = np.where(geo_share["Overall_Share"]>0, 100.0*geo_share["Geo_Share"]/geo_share["Overall_Share"], 0.0)
+        ge = geo_sales.merge(geo_tot, on=geo, how="left")
+        ge["Geo_Share"] = np.where(ge["Geo_Total"]>0, ge["Geo_Sales"]/ge["Geo_Total"], 0.0)
+        ge = ge.merge(overall_share, on=dim, how="left")
+        ge["Index_vs_Overall"] = np.where(ge["Overall_Share"]>0, 100*ge["Geo_Share"]/ge["Overall_Share"], 0.0)
 
-    top_by_geo = (geo_share.sort_values(["Index_vs_Overall"], ascending=False)
-                         .groupby(geo_col).head(topn_geo).reset_index(drop=True))
+        top = (ge.sort_values("Index_vs_Overall", ascending=False)
+                 .groupby(geo).head(topn).reset_index(drop=True))
 
-    st.dataframe(
-        top_by_geo[[geo_col, map_dim, "Index_vs_Overall", "Geo_Share", "Overall_Share", "Geo_Sales"]],
-        hide_index=True, use_container_width=True,
-        column_config={
-            geo_col: st.column_config.TextColumn(geo_col.replace("_"," "), help="Selected geography level."),
-            map_dim: st.column_config.TextColumn(map_dim.replace("_"," "), help="Selected product grain."),
-            "Index_vs_Overall": st.column_config.NumberColumn("Index vs Overall", format="%.1f",
-                                                              help="100 × Geo_Share ÷ Overall_Share."),
-            "Geo_Share": st.column_config.NumberColumn("Geo Share", format="%.2%"),
-            "Overall_Share": st.column_config.NumberColumn("Overall Share", format="%.2%"),
-            "Geo_Sales": st.column_config.NumberColumn("Geo Sales", format="$%.0f"),
+        colcfg3 = {
+            geo: st.column_config.TextColumn(geo.replace("_"," "), help="Selected geography level."),
+            dim: st.column_config.TextColumn(dim.replace("_"," "), help="Item or Brand."),
+            "Index_vs_Overall": st.column_config.NumberColumn("Index vs Overall", format="%.1f", help=GLOSSARY["Index_vs_Overall"]),
+            "Geo_Share": st.column_config.NumberColumn("Geo Share", format="%.2%", help=GLOSSARY["Geo_Share"]),
+            "Overall_Share": st.column_config.NumberColumn("Overall Share", format="%.2%", help=GLOSSARY["Overall_Share"]),
+            "Geo_Sales": st.column_config.NumberColumn("Geo Sales", format="$%.0f", help="Sales for this geo and item/brand."),
         }
-    )
-
-    with st.expander("Heatmap (optional)", expanded=False):
-        try:
-            pivot = top_by_geo.pivot(index=geo_col, columns=map_dim, values="Index_vs_Overall").fillna(100.0)
-            fig_hm = px.imshow(pivot, aspect="auto", title=f"Over/Under Index Heatmap by {geo_col} vs Overall")
-            st.plotly_chart(fig_hm, use_container_width=True)
-        except Exception:
-            st.info("Heatmap not available for current selection.")
-
-    st.download_button(
-        "📥 Download Opportunity Map (CSV)",
-        data=geo_share.to_csv(index=False).encode("utf-8"),
-        file_name="assortment_opportunity_map.csv",
-        mime="text/csv",
-        key="dl_aso_opp"
-    )
+        st.dataframe(top[[geo, dim, "Index_vs_Overall","Geo_Share","Overall_Share","Geo_Sales"]],
+                     hide_index=True, use_container_width=True, column_config=colcfg3)
 
     st.divider()
 
-    # --- D) New Item Tracker ---
-    st.subheader("D) New Item Tracker")
-    if "Item" not in df.columns:
-        st.info("Item column not found for New Item Tracker.")
+    # D) New Item Tracker
+    st.markdown("### D) New Item Tracker")
+    if "Item" not in scope.columns:
+        st.info("Item column required.")
         return
-    with st.expander("Controls — New Items", expanded=True):
-        new_window = st.select_slider("Define 'New' as items first sold within the last:", options=[30,60,90,120,180], value=90, key="aso_new_window_sel")
-        tier_bins = st.selectbox("Price Tiering (within Category)", options=[3,4,5], index=0, key="aso_tiers_sel")
 
-    # First sale computed on filtered view to respect your local filters
-    all_first = df.groupby("Item")["Date"].min().rename("First_Sale_Date").reset_index()
-    new_cutoff = pd.to_datetime(end_date) - pd.Timedelta(days=int(new_window))
-    all_first["Is_New"] = all_first["First_Sale_Date"] >= new_cutoff
+    new_window = st.select_slider("Define 'New' as first sold within last (days)", options=[30,60,90,120,180], value=90, key=f"{prefix}_new_days")
+    tiers = st.selectbox("Price Tiers (within Category)", options=[3,4,5], index=0, key=f"{prefix}_new_tiers")
 
-    f = df.merge(all_first, on="Item", how="left")
-    new_items = f[f["Is_New"] == True].copy()
+    # new items based on RAW (first ever sale)
+    all_first = RAW.groupby("Item")["Date"].min().rename("First_Sale_Date").reset_index()
+    cutoff = pd.to_datetime(end) - pd.Timedelta(days=int(new_window))
+    all_first["Is_New"] = all_first["First_Sale_Date"] >= cutoff
+
+    f = scope.merge(all_first, on="Item", how="left")
+    new_items = f[f["Is_New"]==True].copy()
     if new_items.empty:
-        st.info(f"No items with first sale within the last {new_window} days for current filters.")
+        st.info(f"No items first sold within last {new_window} days.")
         return
 
-    price_col_here = "Unit_Price" if "Unit_Price" in df.columns else None
     price_meta = None
-    if price_col_here:
-        med_price_item = f.groupby("Item")[price_col_here].median().rename("Median_Unit_Price")
-        cats_item = f.groupby("Item")["Category"].agg(lambda x: x.mode().iloc[0] if len(x) else None).rename("Category_Assigned")
-        price_meta = pd.concat([med_price_item, cats_item], axis=1).reset_index()
-        def _apply_tiers(g):
+    if price_col:
+        med_item = f.groupby("Item")[price_col].median().rename("Median_Unit_Price")
+        cat_item = f.groupby("Item")["Category"].agg(lambda x: x.mode().iloc[0] if len(x) else None).rename("Category_Assigned")
+        price_meta = pd.concat([med_item, cat_item], axis=1).reset_index()
+
+        def _tier(g):
             g = g.sort_values("Median_Unit_Price")
-            g["Price_Tier"] = pd.qcut(g["Median_Unit_Price"].rank(method="first"), q=tier_bins, labels=[f"T{i+1}" for i in range(tier_bins)])
+            g["Price_Tier"] = pd.qcut(g["Median_Unit_Price"].rank(method="first"), q=tiers, labels=[f"T{i+1}" for i in range(tiers)])
             return g
-        tier_ref = price_meta.groupby("Category_Assigned", group_keys=True).apply(_apply_tiers).reset_index(drop=True)
-        new_items = new_items.merge(price_meta, on="Item", how="left")
-        new_items = new_items.merge(tier_ref[["Item","Price_Tier"]], on="Item", how="left")
+        ref = price_meta.groupby("Category_Assigned", group_keys=True).apply(_tier).reset_index(drop=True)
+        new_items = new_items.merge(price_meta, on="Item", how="left").merge(ref[["Item","Price_Tier"]], on="Item", how="left")
     else:
         new_items["Median_Unit_Price"] = np.nan
         new_items["Category_Assigned"] = new_items["Category"]
         new_items["Price_Tier"] = "NA"
 
-    perf_base = (f.groupby(["Item","Category"], dropna=False)["Total_Sale"].sum().rename("Item_Sales").reset_index()
-                   .merge(f.groupby(["Item"])["Store_ID"].nunique().rename("Active_Stores").reset_index(),
-                          on="Item", how="left"))
-    perf_base["Weeks"] = n_weeks
-    perf_base["Velocity_$/SKU/Store/Week"] = np.where(
-        (perf_base["Active_Stores"]>0) & (perf_base["Weeks"]>0),
-        perf_base["Item_Sales"]/(perf_base["Active_Stores"]*perf_base["Weeks"]),
-        0.0
-    )
-    new_perf = new_items[["Item","Category","Price_Tier"]].drop_duplicates().merge(perf_base, on=["Item","Category"], how="left")
+    perf = (f.groupby(["Item","Category"], dropna=False)["Total_Sale"].sum().rename("Item_Sales").reset_index()
+              .merge(f.groupby("Item")["Store_ID"].nunique().rename("Active_Stores").reset_index(), on="Item", how="left"))
+    perf["Weeks"] = n_weeks
+    perf["Velocity_$/SKU/Store/Week"] = np.where((perf["Active_Stores"]>0)&(perf["Weeks"]>0),
+                                                 perf["Item_Sales"]/(perf["Active_Stores"]*perf["Weeks"]), 0.0)
 
-    # Benchmark: non-new in same category (+tier if available)
+    new_perf = new_items[["Item","Category","Price_Tier"]].drop_duplicates().merge(perf, on=["Item","Category"], how="left")
+
     bench = f.merge(all_first[all_first["Is_New"]==False][["Item"]].assign(Not_New=True), on="Item", how="inner")
-    if price_meta is not None:
-        bench = bench.merge(price_meta, on="Item", how="left")
+    if price_meta is not None: bench = bench.merge(price_meta, on="Item", how="left")
     else:
         bench["Category_Assigned"] = bench["Category"]; bench["Price_Tier"] = "NA"
 
-    bench_perf = (bench.groupby(["Item","Category_Assigned","Price_Tier"], dropna=False)["Total_Sale"].sum().rename("Item_Sales").reset_index()
-                    .merge(bench.groupby(["Item"])["Store_ID"].nunique().rename("Active_Stores").reset_index(),
-                           on="Item", how="left"))
-    bench_perf["Weeks"] = n_weeks
-    bench_perf["Velocity_$/SKU/Store/Week"] = np.where(
-        (bench_perf["Active_Stores"]>0) & (bench_perf["Weeks"]>0),
-        bench_perf["Item_Sales"]/(bench_perf["Active_Stores"]*bench_perf["Weeks"]),
-        0.0
-    )
+    bperf = (bench.groupby(["Item","Category_Assigned","Price_Tier"], dropna=False)["Total_Sale"].sum().rename("Item_Sales").reset_index()
+                 .merge(bench.groupby("Item")["Store_ID"].nunique().rename("Active_Stores").reset_index(), on="Item", how="left"))
+    bperf["Weeks"] = n_weeks
+    bperf["Velocity_$/SKU/Store/Week"] = np.where((bperf["Active_Stores"]>0)&(bperf["Weeks"]>0),
+                                                 bperf["Item_Sales"]/(bperf["Active_Stores"]*bperf["Weeks"]), 0.0)
 
-    if "Price_Tier" in bench_perf.columns and bench_perf["Price_Tier"].notna().any():
-        bench_avg = bench_perf.groupby(["Category_Assigned","Price_Tier"])["Velocity_$/SKU/Store/Week"].mean().rename("Benchmark_Velocity").reset_index()
-        new_perf = new_perf.merge(bench_avg, left_on=["Category","Price_Tier"], right_on=["Category_Assigned","Price_Tier"], how="left").drop(columns=["Category_Assigned"])
+    if "Price_Tier" in bperf.columns and bperf["Price_Tier"].notna().any():
+        bavg = bperf.groupby(["Category_Assigned","Price_Tier"])["Velocity_$/SKU/Store/Week"].mean().rename("Benchmark_Velocity").reset_index()
+        new_perf = new_perf.merge(bavg, left_on=["Category","Price_Tier"], right_on=["Category_Assigned","Price_Tier"], how="left").drop(columns=["Category_Assigned"])
     else:
-        bench_avg = bench_perf.groupby(["Category_Assigned"])["Velocity_$/SKU/Store/Week"].mean().rename("Benchmark_Velocity").reset_index()
-        new_perf = new_perf.merge(bench_avg, left_on=["Category"], right_on=["Category_Assigned"], how="left").drop(columns=["Category_Assigned"])
+        bavg = bperf.groupby(["Category_Assigned"])["Velocity_$/SKU/Store/Week"].mean().rename("Benchmark_Velocity").reset_index()
+        new_perf = new_perf.merge(bavg, left_on=["Category"], right_on=["Category_Assigned"], how="left").drop(columns=["Category_Assigned"])
 
     new_perf["Benchmark_Velocity"] = new_perf["Benchmark_Velocity"].fillna(0.0)
-    new_perf["Velocity_vs_Benchmark_%"] = np.where(
-        new_perf["Benchmark_Velocity"]>0,
-        100.0*new_perf["Velocity_$/SKU/Store/Week"]/new_perf["Benchmark_Velocity"],
-        np.nan
-    )
+    new_perf["Velocity_vs_Benchmark_%"] = np.where(new_perf["Benchmark_Velocity"]>0,
+                                                   100*new_perf["Velocity_$/SKU/Store/Week"]/new_perf["Benchmark_Velocity"], np.nan)
     if price_meta is not None:
         new_perf = new_perf.merge(price_meta[["Item","Median_Unit_Price"]], on="Item", how="left")
 
-    new_perf = new_perf.sort_values(["Category","Velocity_vs_Benchmark_%"], ascending=[True,False]).reset_index(drop=True)
-
+    show_cols = [c for c in ["Item","Category","Price_Tier","Median_Unit_Price","Active_Stores","Weeks",
+                             "Velocity_$/SKU/Store/Week","Benchmark_Velocity","Velocity_vs_Benchmark_%"] if c in new_perf.columns]
     st.dataframe(
-        new_perf[[c for c in ["Item","Category","Price_Tier","Median_Unit_Price","Active_Stores","Weeks",
-                              "Velocity_$/SKU/Store/Week","Benchmark_Velocity","Velocity_vs_Benchmark_%"] if c in new_perf.columns]],
+        new_perf[show_cols].sort_values(["Category","Velocity_vs_Benchmark_%"], ascending=[True,False]).reset_index(drop=True),
         hide_index=True, use_container_width=True,
         column_config={
-            "Median_Unit_Price": st.column_config.NumberColumn("Median Unit Price", format="$%.2f"),
-            "Velocity_$/SKU/Store/Week": st.column_config.NumberColumn("Velocity ($/SKU/store/week)", format="$%.2f"),
-            "Benchmark_Velocity": st.column_config.NumberColumn("Benchmark Velocity", format="$%.2f"),
-            "Velocity_vs_Benchmark_%": st.column_config.NumberColumn("Velocity vs Benchmark (%)", format="%.1f"),
+            "Median_Unit_Price": st.column_config.NumberColumn("Median Unit Price", format="$%.2f", help=GLOSSARY["Median_Unit_Price"]),
             "Active_Stores": st.column_config.NumberColumn("Active Stores", format="%d"),
             "Weeks": st.column_config.NumberColumn("Weeks", format="%d"),
+            "Velocity_$/SKU/Store/Week": st.column_config.NumberColumn("Velocity ($/SKU/store/week)", format="$%.2f", help=GLOSSARY["Velocity_$/SKU/Store/Week"]),
+            "Benchmark_Velocity": st.column_config.NumberColumn("Benchmark Velocity", format="$%.2f"),
+            "Velocity_vs_Benchmark_%": st.column_config.NumberColumn("Velocity vs Benchmark (%)", format="%.1f"),
         }
     )
-    try:
-        chart_df = new_perf.dropna(subset=["Velocity_vs_Benchmark_%"]).head(20)
-        fig_new = px.bar(chart_df, x="Item", y="Velocity_vs_Benchmark_%", color="Category",
-                         title="New Item Velocity vs Benchmark (%) — Top 20", text_auto=".1f")
-        fig_new.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_new, use_container_width=True)
-    except Exception:
-        pass
-    st.download_button(
-        "📥 Download New Item Tracker (CSV)",
-        data=new_perf.to_csv(index=False).encode("utf-8"),
-        file_name="new_item_tracker.csv",
-        mime="text/csv",
-        key="dl_aso_new"
-    )
 
-# ---------------------------------
-# Data Load (no upload)
-# ---------------------------------
-DATA_PATH = "cstorereal.csv"
-if not os.path.exists(DATA_PATH):
-    st.error(f"CSV not found at: {os.path.abspath(DATA_PATH)}")
-    st.stop()
+# ----------------------------
+# Main: Tabs based on Department
+# ----------------------------
+st.markdown("<h2 style='margin-top:0'>C-Store KPI Insights Suite</h2>", unsafe_allow_html=True)
 
-try:
-    raw_df = load_and_normalize(DATA_PATH)
-except Exception as e:
-    st.error(f"Error loading or cleaning data: {e}")
-    st.stop()
+visible_tabs = DEPT_TABS.get(department, DEPT_TABS["All Departments"])
 
-# ---------------------------------
-# Global Sidebar: Department only
-# ---------------------------------
-st.sidebar.header("Department")
+# Build tabs dynamically in requested order
+tab_objs = st.tabs(visible_tabs)
 
-TAB_ORDER = [
-    "📊 KPI Overview",
-    "📈 KPI Trends",
-    "🏆 Top-N Views",
-    "🧺 Basket Affinity",
-    "💲 Price Ladder",
-    "🗺️ Store Map",
-    "📦 Assortment & Space Optimization",
-]
+tab_map = {name: obj for name, obj in zip(visible_tabs, tab_objs)}
 
-DEPARTMENT_TO_TABS = {
-    "Strategy & Finance": [
-        "📊 KPI Overview",
-        "📈 KPI Trends",
-    ],
-    "Sales & Category": [
-        "📊 KPI Overview",
-        "🏆 Top-N Views",
-        "🧺 Basket Affinity",
-        "💲 Price Ladder",
-        "🗺️ Store Map",
-    ],
-    "Marketing & CRM": [
-        "📊 KPI Overview",
-        "📈 KPI Trends",
-        "🧺 Basket Affinity",
-        "🏆 Top-N Views",
-    ],
-    "Operations & Supply": [
-        "🗺️ Store Map",
-        "📊 KPI Overview",
-    ],
-    "Merchandising & Space": [
-        "📦 Assortment & Space Optimization",
-        "💲 Price Ladder",
-        "🏆 Top-N Views",
-    ],
-    "Exec & Field": [
-        "📊 KPI Overview",
-        "🗺️ Store Map",
-        "📈 KPI Trends",
-    ],
-    "All Departments": TAB_ORDER,
-}
+if "📊 KPI Overview" in tab_map:
+    with tab_map["📊 KPI Overview"]:
+        view_kpi_overview(RAW, prefix="kpi")
 
-dept = st.sidebar.selectbox("Choose department", list(DEPARTMENT_TO_TABS.keys()), index=0, key="dept_select")
+if "📈 KPI Trends" in tab_map:
+    with tab_map["📈 KPI Trends"]:
+        view_kpi_trends(RAW, prefix="trend")
 
-# ---------------------------------
-# Main
-# ---------------------------------
-if not raw_df.empty:
-    with st.expander("🧯 Data Validation (Full Dataset)", expanded=False):
-        rows = len(raw_df)
-        baskets = raw_df["Transaction_ID"].nunique()
-        min_d = raw_df["Date"].min().date()
-        max_d = raw_df["Date"].max().date()
-        st.caption(f"Rows: **{rows:,}** | Baskets: **{baskets:,}** | Date Range: **{min_d} → {max_d}**")
-        issues = []
-        if "Quantity" in raw_df.columns and (raw_df["Quantity"] <= 0).any(): issues.append("Non-positive Quantity")
-        if "Total_Sale" in raw_df.columns and (raw_df["Total_Sale"] < 0).any(): issues.append("Negative Total_Sale")
-        if issues: st.warning(" | ".join(issues))
-        else: st.success("No obvious data issues detected.")
+if "🏆 Top-N Views" in tab_map:
+    with tab_map["🏆 Top-N Views"]:
+        view_topn(RAW, prefix="topn")
 
-    allowed_tabs = [t for t in TAB_ORDER if t in DEPARTMENT_TO_TABS.get(dept, [])]
-    tabs = st.tabs(allowed_tabs)
+if "🧺 Basket Affinity" in tab_map:
+    with tab_map["🧺 Basket Affinity"]:
+        view_affinity(RAW, prefix="aff")
 
-    for label, container in zip(allowed_tabs, tabs):
-        with container:
-            if label == "📊 KPI Overview":
-                tab_kpi_overview(raw_df)
-            elif label == "📈 KPI Trends":
-                tab_kpi_trends(raw_df)
-            elif label == "🏆 Top-N Views":
-                tab_top_n(raw_df)
-            elif label == "🧺 Basket Affinity":
-                tab_basket_affinity(raw_df)
-            elif label == "💲 Price Ladder":
-                tab_price_ladder(raw_df)
-            elif label == "🗺️ Store Map":
-                tab_store_map(raw_df)
-            elif label == "📦 Assortment & Space Optimization":
-                tab_assortment_space(raw_df)
-else:
-    st.info("No data available.")
+if "💲 Price Ladder" in tab_map:
+    with tab_map["💲 Price Ladder"]:
+        view_price_ladder(RAW, prefix="pl")
+
+if "🗺️ Store Map" in tab_map:
+    with tab_map["🗺️ Store Map"]:
+        view_store_map(RAW, prefix="map")
+
+if "📦 Assortment & Space Optimization" in tab_map:
+    with tab_map["📦 Assortment & Space Optimization"]:
+        view_assortment_space(RAW, prefix="aso")
