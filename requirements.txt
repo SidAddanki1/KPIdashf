@@ -1,6 +1,8 @@
-streamlit>=1.39
-pandas>=2.2
-numpy>=1.26
-scipy>=1.11
-statsmodels>=0.14.2
-plotly>=5.24
+streamlit==1.38.0
+plotly==5.24.1
+pandas==2.2.2
+numpy==1.26.4
+statsmodels==0.14.2
+pyarrow==17.0.0
+scipy==1.13.1
+python-dateutil>=2.9.0
